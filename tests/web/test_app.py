@@ -1,7 +1,14 @@
 from fastapi.testclient import TestClient
 
 from tiddl.cli.utils.auth import AuthData
-from tiddl.web.app import DownloadJob, WebState, create_app, format_bytes, strip_rich
+from tiddl.web.app import (
+    DownloadJob,
+    WebState,
+    clamp_concurrency,
+    create_app,
+    format_bytes,
+    strip_rich,
+)
 
 
 def test_session_panel_prompts_for_login(monkeypatch):
@@ -20,7 +27,7 @@ def test_jobs_panel_renders_empty_queue():
     response = client.get("/partials/jobs")
 
     assert response.status_code == 200
-    assert "No downloads queued" in response.text
+    assert "Sin descargas en cola" in response.text
 
 
 def test_jobs_panel_renders_existing_job():
@@ -48,3 +55,9 @@ def test_strip_rich_removes_known_tags():
 
 def test_format_bytes_scales_units():
     assert format_bytes(1536) == "1.5 KB"
+
+
+def test_clamp_concurrency_limits_to_three():
+    assert clamp_concurrency(0) == 1
+    assert clamp_concurrency(2) == 2
+    assert clamp_concurrency(9) == 3

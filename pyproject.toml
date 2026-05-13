@@ -30,10 +30,11 @@ dependencies = [
 ]
 
 [project.urls]
-homepage = "https://github.com/oskvr37/tiddl"
+homepage = "https://github.com/CapitanRalph/tiddl"
 
 [project.scripts]
 tiddl = "tiddl.cli.app:app"
+tiddl-desktop = "tiddl.cli.commands.desktop:main"
 
 [tool.coverage.run]
 omit = ["*/models/*", "*/models.py"]

@@ -58,6 +58,52 @@ def convert_to_mp4(source: Path) -> Path:
     return output_path
 
 
+def convert_audio_to_wav(source: Path) -> Path:
+    output_path = source.with_suffix(".wav")
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+    if source != output_path:
+        source.unlink()
+
+    return output_path
+
+
+def convert_audio_to_mp3_320(source: Path) -> Path:
+    output_path = source.with_suffix(".mp3")
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "320k",
+            str(output_path),
+        ]
+    )
+
+    if source != output_path:
+        source.unlink()
+
+    return output_path
+
+
 def extract_flac(source: Path) -> Path:
     """
     Extract FLAC audio from an MP4 container.

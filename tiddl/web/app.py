@@ -23,9 +23,11 @@ from tiddl.core.api.models import Album, AlbumItemsCredits, Track, Video
 from tiddl.core.auth import AuthAPI, AuthClientError
 from tiddl.core.metadata import Cover, add_track_metadata, add_video_metadata
 from tiddl.core.utils.const import track_qualities, video_qualities
+from tiddl.core.utils.ffmpeg import convert_audio_to_mp3_320, convert_audio_to_wav
 from tiddl.core.utils.format import format_template
 
 ResourceKind = Literal["track", "album", "playlist"]
+AudioOutputFormat = Literal["raw", "wav", "mp3_320"]
 
 
 @dataclass
@@ -48,12 +50,18 @@ class JobResult:
 class DownloadJob:
     id: str
     resource: str
+    output_format: AudioOutputFormat = "raw"
+    concurrency: int = 3
+    track_quality: TRACK_QUALITY_LITERAL = "high"
+    video_quality: VIDEO_QUALITY_LITERAL = "fhd"
     status: str = "queued"
     message: str = "Queued"
     total: int = 0
     completed: int = 0
     bytes_downloaded: int = 0
     results: list[JobResult] = field(default_factory=list)
+    active_items: dict[int, str] = field(default_factory=dict)
+    terminal: list[str] = field(default_factory=list)
     error: str = ""
     created_at: float = field(default_factory=time.time)
 
@@ -102,7 +110,10 @@ class WebConsole:
         self.job = job
 
     def print(self, *values: Any, **_: Any) -> None:
-        self.job.message = " ".join(str(value) for value in values)
+        message = " ".join(str(value) for value in values)
+        self.job.message = strip_rich(message)
+        self.job.terminal.append(self.job.message)
+        self.job.terminal = self.job.terminal[-40:]
 
 
 @dataclass
@@ -123,9 +134,12 @@ class WebOutput:
     def download_start(self, description: str) -> int:
         task_id = self.next_task_id
         self.next_task_id += 1
-        self.tasks[task_id] = WebTask(description=strip_rich(description))
+        clean_description = strip_rich(description)
+        self.tasks[task_id] = WebTask(description=clean_description)
+        self.job.active_items[task_id] = clean_description
         self.job.status = "running"
-        self.job.message = strip_rich(description)
+        self.job.message = clean_description
+        self.job.terminal.append(f"Starting {clean_description}")
         return task_id
 
     def download_advance(self, task_id: int, size: float) -> None:
@@ -133,6 +147,7 @@ class WebOutput:
 
     def download_finish(self, task_id: int) -> WebTask:
         task = self.tasks.pop(task_id)
+        self.job.active_items.pop(task_id, None)
         self.job.completed += 1
         return task
 
@@ -146,6 +161,24 @@ class WebOutput:
                 status=strip_rich(result_message),
             )
         )
+        self.job.terminal.append(
+            f"{strip_rich(result_message)} {strip_rich(item_description)}"
+        )
+        self.job.terminal = self.job.terminal[-40:]
+
+    def update_last_result_path(self, path: Path) -> None:
+        if not self.job.results:
+            return
+
+        self.job.results[-1].path = str(path)
+
+    def show_item_error(self, item: Track | Video, error: Exception) -> None:
+        message = f"{item.title}: {error}"
+        self.job.results.append(
+            JobResult(title=item.title, path="", status=f"Error {error}")
+        )
+        self.job.terminal.append(message)
+        self.job.terminal = self.job.terminal[-40:]
 
 
 @dataclass
@@ -221,27 +254,54 @@ def create_app(state: WebState | None = None) -> FastAPI:
         api = web_state.api()
         return render_library(api, kind)
 
-    @app.post("/jobs", response_class=HTMLResponse)
-    def create_job(resource: str = Form(...)) -> str:
+    @app.get("/partials/preview", response_class=HTMLResponse)
+    def preview(resource: str) -> str:
         api = web_state.api()
         try:
-            tidal_resource = TidalResource.from_string(resource.strip())
+            tidal_resource = parse_supported_resource(resource)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        if tidal_resource.type not in ("track", "album", "playlist"):
-            raise HTTPException(
-                status_code=400,
-                detail="The desktop app supports tracks, albums and playlists.",
-            )
+        return render_preview(api, tidal_resource)
 
-        job = DownloadJob(id=uuid4().hex[:8], resource=str(tidal_resource))
+    @app.post("/jobs", response_class=HTMLResponse)
+    def create_job(
+        resource: str = Form(...),
+        output_format: AudioOutputFormat = Form("raw"),
+        concurrency: int = Form(3),
+        track_quality: TRACK_QUALITY_LITERAL = Form("high"),
+        video_quality: VIDEO_QUALITY_LITERAL = Form("fhd"),
+    ) -> str:
+        api = web_state.api()
+        try:
+            tidal_resource = parse_supported_resource(resource.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        concurrency = clamp_concurrency(concurrency)
+
+        job = DownloadJob(
+            id=uuid4().hex[:8],
+            resource=str(tidal_resource),
+            output_format=output_format,
+            concurrency=concurrency,
+            track_quality=track_quality,
+            video_quality=video_quality,
+        )
         with web_state.lock:
             web_state.jobs[job.id] = job
 
         thread = threading.Thread(
             target=run_download_job,
-            args=(api, tidal_resource, job),
+            args=(
+                api,
+                tidal_resource,
+                job,
+                output_format,
+                concurrency,
+                track_quality,
+                video_quality,
+            ),
             daemon=True,
         )
         thread.start()
@@ -250,6 +310,10 @@ def create_app(state: WebState | None = None) -> FastAPI:
     @app.get("/partials/jobs", response_class=HTMLResponse)
     def jobs() -> str:
         return render_jobs(web_state)
+
+    @app.get("/partials/status", response_class=HTMLResponse)
+    def status() -> str:
+        return render_status(web_state)
 
     return app
 
@@ -306,12 +370,45 @@ def ensure_fresh_auth(auth_api: AuthAPI, force: bool = False) -> AuthData:
     return auth_data
 
 
+def parse_supported_resource(resource: str) -> TidalResource:
+    tidal_resource = TidalResource.from_string(resource)
+
+    if tidal_resource.type not in ("track", "album", "playlist"):
+        raise ValueError("La aplicacion soporta tracks, albumes y playlists.")
+
+    return tidal_resource
+
+
+def clamp_concurrency(value: int) -> int:
+    return max(1, min(3, value))
+
+
 def run_download_job(
-    api: TidalAPI, resource: TidalResource, job: DownloadJob
+    api: TidalAPI,
+    resource: TidalResource,
+    job: DownloadJob,
+    output_format: AudioOutputFormat,
+    concurrency: int,
+    track_quality: TRACK_QUALITY_LITERAL,
+    video_quality: VIDEO_QUALITY_LITERAL,
 ) -> None:
     try:
         job.status = "running"
-        asyncio.run(download_resource(api, resource, job))
+        job.message = "Preparing download"
+        job.terminal.append(
+            f"Queued {resource} as {output_format.upper()} with {concurrency} workers"
+        )
+        asyncio.run(
+            download_resource(
+                api,
+                resource,
+                job,
+                output_format,
+                concurrency,
+                track_quality,
+                video_quality,
+            )
+        )
         if job.status != "failed":
             job.status = "done"
             job.message = "Finished"
@@ -319,18 +416,25 @@ def run_download_job(
         job.status = "failed"
         job.error = str(exc)
         job.message = str(exc)
+        job.terminal.append(f"Error: {exc}")
 
 
 async def download_resource(
-    api: TidalAPI, resource: TidalResource, job: DownloadJob
+    api: TidalAPI,
+    resource: TidalResource,
+    job: DownloadJob,
+    output_format: AudioOutputFormat,
+    concurrency: int,
+    track_quality: TRACK_QUALITY_LITERAL,
+    video_quality: VIDEO_QUALITY_LITERAL,
 ) -> None:
     output = WebOutput(job)
     downloader = Downloader(
         tidal_api=api,
-        threads_count=CONFIG.download.threads_count,
+        threads_count=clamp_concurrency(concurrency),
         rich_output=output,  # type: ignore[arg-type]
-        track_quality=CONFIG.download.track_quality,
-        video_quality=CONFIG.download.video_quality,
+        track_quality=track_quality,
+        video_quality=video_quality,
         videos_filter=CONFIG.download.videos_filter,
         skip_existing=CONFIG.download.skip_existing,
         download_path=CONFIG.download.download_path,
@@ -346,12 +450,31 @@ async def download_resource(
     ) -> tuple[Path | None, Track | Video]:
         output.total_increment()
         metadata = metadata or MetadataPayload()
-        path, was_downloaded = await downloader.download(item, Path(file_path))
 
-        if not path or not (CONFIG.metadata.enable and was_downloaded):
+        try:
+            path, was_downloaded = await downloader.download(item, Path(file_path))
+        except Exception as exc:
+            output.show_item_error(item, exc)
+            raise
+
+        if not path:
+            return path, item
+
+        if isinstance(item, Track) and was_downloaded:
+            try:
+                path = convert_track_output(path, output_format)
+                output.update_last_result_path(path)
+            except Exception as exc:
+                output.show_item_error(item, exc)
+                raise
+
+        if not (CONFIG.metadata.enable and was_downloaded):
             return path, item
 
         if isinstance(item, Track):
+            if output_format != "raw":
+                return path, item
+
             if not metadata.cover and item.album.cover and CONFIG.metadata.cover:
                 metadata.cover = Cover(item.album.cover)
 
@@ -381,7 +504,7 @@ async def download_resource(
                     CONFIG.templates.track,
                     item=track,
                     album=album,
-                    quality=get_item_quality(track),
+                    quality=get_item_quality(track, track_quality, video_quality),
                 ),
                 MetadataPayload(
                     date=str(album.releaseDate or ""),
@@ -392,7 +515,9 @@ async def download_resource(
 
         case "album":
             album = api.get_album(resource.id)
-            await download_album(api, album, handle_item)
+            await download_album(
+                api, album, handle_item, track_quality, video_quality
+            )
 
         case "playlist":
             playlist = api.get_playlist(resource.id)
@@ -421,7 +546,9 @@ async def download_resource(
                                 album=album,
                                 playlist=playlist,
                                 playlist_index=playlist_index,
-                                quality=get_item_quality(item),
+                                quality=get_item_quality(
+                                    item, track_quality, video_quality
+                                ),
                             ),
                         )
                     )
@@ -436,7 +563,13 @@ async def download_resource(
             raise ValueError(f"Unsupported resource type: {resource.type}")
 
 
-async def download_album(api: TidalAPI, album: Album, handle_item: Any) -> None:
+async def download_album(
+    api: TidalAPI,
+    album: Album,
+    handle_item: Any,
+    track_quality: TRACK_QUALITY_LITERAL,
+    video_quality: VIDEO_QUALITY_LITERAL,
+) -> None:
     offset = 0
     futures = []
     cover = Cover(album.cover, size=CONFIG.cover.size) if album.cover else None
@@ -452,7 +585,7 @@ async def download_album(api: TidalAPI, album: Album, handle_item: Any) -> None:
                         CONFIG.templates.album,
                         item=item,
                         album=album,
-                        quality=get_item_quality(item),
+                        quality=get_item_quality(item, track_quality, video_quality),
                     ),
                     MetadataPayload(
                         date=str(album.releaseDate or ""),
@@ -470,15 +603,27 @@ async def download_album(api: TidalAPI, album: Album, handle_item: Any) -> None:
     await asyncio.gather(*futures)
 
 
-def get_item_quality(item: Track | Video) -> str:
+def get_item_quality(
+    item: Track | Video,
+    track_quality: TRACK_QUALITY_LITERAL,
+    video_quality: VIDEO_QUALITY_LITERAL,
+) -> str:
     if isinstance(item, Track):
-        configured: TRACK_QUALITY_LITERAL = CONFIG.download.track_quality
-        if configured == "max" and "HIRES_LOSSLESS" not in item.mediaMetadata.tags:
+        if track_quality == "max" and "HIRES_LOSSLESS" not in item.mediaMetadata.tags:
             return "HIGH"
-        return track_qualities[configured]
+        return track_qualities[track_quality]
 
-    configured_video: VIDEO_QUALITY_LITERAL = CONFIG.download.video_quality
-    return video_qualities[configured_video]
+    return video_qualities[video_quality]
+
+
+def convert_track_output(path: Path, output_format: AudioOutputFormat) -> Path:
+    match output_format:
+        case "raw":
+            return path
+        case "wav":
+            return convert_audio_to_wav(path)
+        case "mp3_320":
+            return convert_audio_to_mp3_320(path)
 
 
 def render_library(api: TidalAPI, kind: ResourceKind) -> str:
@@ -513,6 +658,56 @@ def render_library(api: TidalAPI, kind: ResourceKind) -> str:
         return '<p class="muted">No favorites found for this type.</p>'
 
     return "".join(rows)
+
+
+def render_preview(api: TidalAPI, resource: TidalResource) -> str:
+    match resource.type:
+        case "playlist":
+            playlist = api.get_playlist(resource.id)
+            items = api.get_playlist_items(resource.id, limit=50)
+            rows = [
+                preview_item_row(index + 1, item.item)
+                for index, item in enumerate(items.items)
+            ]
+            title = playlist.title
+            meta = f"{playlist.numberOfTracks} tracks · {playlist.numberOfVideos} videos"
+
+        case "album":
+            album = api.get_album(resource.id)
+            items = api.get_album_items(resource.id, limit=50)
+            rows = [
+                preview_item_row(index + 1, item.item)
+                for index, item in enumerate(items.items)
+            ]
+            title = album.title
+            artist = album.artist.name if album.artist else "Album"
+            meta = f"{artist} · {album.numberOfTracks} tracks"
+
+        case "track":
+            track = api.get_track(resource.id)
+            title = track.title
+            artist = track.artist.name if track.artist else "Track"
+            meta = f"{artist} · {track.audioQuality} · {track.duration}s"
+            rows = [preview_item_row(1, track)]
+
+        case _:
+            raise ValueError(f"Unsupported resource type: {resource.type}")
+
+    return f"""
+    <section class="preview-card">
+      <div class="preview-head">
+        <div>
+          <h2>{escape(title)}</h2>
+          <p class="muted">{escape(meta)}</p>
+          <code>{escape(str(resource))}</code>
+        </div>
+        {download_form(str(resource), compact=False)}
+      </div>
+      <div class="track-list">
+        {"".join(rows)}
+      </div>
+    </section>
+    """
 
 
 def render_session_panel(state: WebState) -> str:
@@ -558,16 +753,38 @@ def render_login_attempt(attempt: LoginAttempt) -> str:
 def render_jobs(state: WebState) -> str:
     jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
     if not jobs:
-        return '<section id="jobs" class="jobs"><p class="muted">No downloads queued.</p></section>'
+        return """
+        <section id="jobs" class="job-board">
+          <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
+          <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
+          <div class="job-column"><h3>Errores</h3><p class="muted">Sin errores.</p></div>
+        </section>
+        """
 
-    rows = [render_job(job) for job in jobs[:25]]
-    return f'<section id="jobs" class="jobs">{"".join(rows)}</section>'
+    queued = [job for job in jobs if job.status in ("queued", "running")]
+    done = [job for job in jobs if job.status == "done"]
+    failed = [job for job in jobs if job.status == "failed"]
+    return f"""
+    <section id="jobs" class="job-board">
+      {render_job_column("En cola", queued)}
+      {render_job_column("Completadas", done)}
+      {render_job_column("Errores", failed)}
+    </section>
+    """
+
+
+def render_job_column(title: str, jobs: list[DownloadJob]) -> str:
+    if not jobs:
+        return f'<div class="job-column"><h3>{escape(title)}</h3><p class="muted">Sin registros.</p></div>'
+
+    rows = [render_job(job) for job in jobs[:12]]
+    return f'<div class="job-column"><h3>{escape(title)}</h3>{"".join(rows)}</div>'
 
 
 def render_job(job: DownloadJob) -> str:
     percent = int((job.completed / job.total) * 100) if job.total else 0
     results = "".join(
-        f'<li><span>{escape(result.status)}</span><code>{escape(result.path)}</code></li>'
+        f'<li><span>{escape(result.status)}</span><code>{escape(result.path or result.title)}</code></li>'
         for result in job.results[-4:]
     )
     error = f'<p class="error">{escape(job.error)}</p>' if job.error else ""
@@ -579,7 +796,7 @@ def render_job(job: DownloadJob) -> str:
       </div>
       <p class="muted">{escape(job.message)}</p>
       <div class="meter"><span style="width: {percent}%"></span></div>
-      <p class="muted">{job.completed}/{job.total or '?'} items · {format_bytes(job.bytes_downloaded)}</p>
+      <p class="muted">{job.completed}/{job.total or '?'} items · {format_bytes(job.bytes_downloaded)} · {escape(job.output_format.upper())} · audio {escape(job.track_quality.upper())} · video {escape(job.video_quality.upper())} · {job.concurrency}x</p>
       {error}
       <ul>{results}</ul>
     </article>
@@ -588,80 +805,236 @@ def render_job(job: DownloadJob) -> str:
 
 def resource_row(kind: str, title: str, meta: str, resource: str) -> str:
     return f"""
-    <article class="resource-row">
-      <div>
+    <article class="resource-row" hx-get="/partials/preview?resource={escape(resource)}" hx-target="#preview" hx-swap="innerHTML">
+      <div class="resource-main">
         <strong>{escape(title)}</strong>
         <p class="muted">{escape(kind.title())} · {escape(meta)}</p>
       </div>
-      <form hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
-        <input type="hidden" name="resource" value="{escape(resource)}">
-        <button>Download</button>
-      </form>
+      <button hx-get="/partials/preview?resource={escape(resource)}" hx-target="#preview" hx-swap="innerHTML">Vista previa</button>
     </article>
+    """
+
+
+def preview_item_row(index: int, item: Track | Video) -> str:
+    artist = item.artist.name if item.artist else ""
+    if isinstance(item, Track):
+        detail = f"{artist} · track {item.trackNumber} · {item.audioQuality}"
+        resource = f"track/{item.id}"
+    else:
+        detail = f"{artist} · video · {item.quality}"
+        resource = f"video/{item.id}"
+
+    return f"""
+    <article class="track-row">
+      <span>{index:02d}</span>
+      <div>
+        <strong>{escape(item.title)}</strong>
+        <p class="muted">{escape(detail)}</p>
+      </div>
+      {download_form(resource, compact=True) if isinstance(item, Track) else ""}
+    </article>
+    """
+
+
+def download_form(resource: str, compact: bool) -> str:
+    compact_class = "compact-form" if compact else "download-form"
+    return f"""
+    <form class="{compact_class}" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
+      <input type="hidden" name="resource" value="{escape(resource)}">
+      <label>
+        <span>Calidad audio</span>
+        <select name="track_quality">
+          {quality_options(CONFIG.download.track_quality)}
+        </select>
+      </label>
+      <label>
+        <span>Calidad video</span>
+        <select name="video_quality">
+          {video_quality_options(CONFIG.download.video_quality)}
+        </select>
+      </label>
+      <label>
+        <span>Salida</span>
+        <select name="output_format">
+          <option value="raw">RAW</option>
+          <option value="wav">WAV</option>
+          <option value="mp3_320">MP3 320</option>
+        </select>
+      </label>
+      <label>
+        <span>Paralelo</span>
+        <input name="concurrency" type="number" min="1" max="3" value="3">
+      </label>
+      <button class="primary">Descargar</button>
+    </form>
+    """
+
+
+def quality_options(selected: TRACK_QUALITY_LITERAL) -> str:
+    labels: dict[TRACK_QUALITY_LITERAL, str] = {
+        "low": "LOW - 96 kbps",
+        "normal": "NORMAL - 320 kbps",
+        "high": "HIGH - FLAC 16-bit/44.1 kHz",
+        "max": "MAX - HiRes hasta 24-bit/192 kHz",
+    }
+    return "".join(
+        f'<option value="{value}"{" selected" if value == selected else ""}>{label}</option>'
+        for value, label in labels.items()
+    )
+
+
+def video_quality_options(selected: VIDEO_QUALITY_LITERAL) -> str:
+    labels: dict[VIDEO_QUALITY_LITERAL, str] = {
+        "sd": "SD - 360p",
+        "hd": "HD - 720p",
+        "fhd": "FHD - 1080p",
+    }
+    return "".join(
+        f'<option value="{value}"{" selected" if value == selected else ""}>{label}</option>'
+        for value, label in labels.items()
+    )
+
+
+def render_status(state: WebState) -> str:
+    jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
+    running = [job for job in jobs if job.status == "running"]
+    queued = [job for job in jobs if job.status == "queued"]
+    done = [job for job in jobs if job.status == "done"]
+    failed = [job for job in jobs if job.status == "failed"]
+    active = running[0] if running else None
+    active_downloads = ", ".join(active.active_items.values()) if active else "Ninguna"
+    latest_terminal = "Sin actividad"
+
+    for job in jobs:
+        if job.terminal:
+            latest_terminal = job.terminal[-1]
+            break
+
+    return f"""
+    <section id="status-bar" class="status-bar">
+      <div>
+        <strong>Terminal</strong>
+        <p>{escape(latest_terminal)}</p>
+      </div>
+      <div>
+        <strong>Descarga actual</strong>
+        <p>{escape(active_downloads)}</p>
+      </div>
+      <div>
+        <strong>Progreso</strong>
+        <p>{len(running)} activas · {len(queued)} en cola · {len(done)} completas · {len(failed)} errores</p>
+      </div>
+    </section>
     """
 
 
 def page() -> str:
     return """
     <!doctype html>
-    <html lang="en">
+    <html lang="es">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>tiddl desktop</title>
+      <title>Psybots Tiddl</title>
       <script src="https://unpkg.com/htmx.org@2.0.4"></script>
       <style>
-        :root { color-scheme: light; --ink: #172026; --muted: #65717a; --line: #d9dee3; --panel: #f7f8fa; --accent: #0f7b68; --danger: #ad3030; }
+        :root { color-scheme: light; --ink: #172026; --muted: #65717a; --line: #d9dee3; --panel: #f7f8fa; --accent: #0f7b68; --danger: #ad3030; --warn: #9c6a12; }
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; color: var(--ink); }
-        header { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--line); background: #fbfbfc; }
-        main { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; min-height: calc(100vh - 56px); }
-        aside { border-right: 1px solid var(--line); padding: 18px; background: var(--panel); }
-        section.content { padding: 18px; }
+        body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; color: var(--ink); overflow: hidden; }
+        header { height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--line); background: #fbfbfc; }
+        main { display: grid; grid-template-columns: minmax(330px, 420px) minmax(460px, 1fr); height: calc(100vh - 154px); }
+        aside { border-right: 1px solid var(--line); padding: 16px; background: var(--panel); overflow: auto; }
+        section.workspace { display: grid; grid-template-rows: minmax(280px, 1fr) minmax(210px, 34vh); min-height: 0; }
+        section.preview-pane, section.queue-pane { padding: 16px; overflow: auto; }
+        section.preview-pane { border-bottom: 1px solid var(--line); }
         h1 { font-size: 18px; margin: 0; }
         h2 { font-size: 15px; margin: 0 0 6px; }
+        h3 { font-size: 13px; margin: 0 0 8px; }
         .muted { color: var(--muted); margin: 0; font-size: 13px; }
         .panel { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid var(--line); background: #fff; border-radius: 8px; margin-bottom: 14px; }
         .actions, .tabs, form.inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        button, input { height: 36px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); padding: 0 12px; font: inherit; }
+        button, input, select { height: 36px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); padding: 0 10px; font: inherit; }
         input { min-width: 0; width: 100%; }
         button { cursor: pointer; }
         button.primary { background: var(--accent); color: white; border-color: var(--accent); }
         .tabs button { min-width: 82px; }
         .link { color: var(--accent); font-size: 13px; }
-        .resource-row, .job { border-bottom: 1px solid var(--line); padding: 12px 0; }
+        .resource-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 12px 0; }
         .resource-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+        .resource-main { min-width: 0; }
+        .resource-row:hover { background: #eef6f4; margin: 0 -8px; padding-left: 8px; padding-right: 8px; border-radius: 6px; }
+        .preview-card { border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 14px; border-bottom: 1px solid var(--line); }
+        .track-list { padding: 0 14px 6px; }
+        .track-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center; }
+        .download-form, .compact-form { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+        .download-form label, .compact-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+        .compact-form select { width: 96px; }
+        .compact-form input { width: 70px; }
+        .compact-form label:first-of-type select { width: 150px; }
+        .compact-form label:nth-of-type(2) select { width: 120px; }
+        .manual-download { display: grid; gap: 8px; width: 100%; }
+        .manual-download .settings { display: grid; grid-template-columns: 1fr 150px 120px 96px 88px auto; gap: 8px; align-items: end; }
+        .job-board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
         .job-top { display: flex; justify-content: space-between; gap: 12px; }
         .badge { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; text-transform: uppercase; }
         .badge.done { color: var(--accent); border-color: var(--accent); }
         .badge.failed { color: var(--danger); border-color: var(--danger); }
+        .badge.running { color: var(--warn); border-color: var(--warn); }
         .meter { height: 6px; background: #e8ecef; border-radius: 999px; overflow: hidden; margin: 8px 0; }
         .meter span { display: block; height: 100%; background: var(--accent); }
         ul { margin: 8px 0 0; padding-left: 18px; }
         code { font-size: 12px; word-break: break-all; }
         .error { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
-        @media (max-width: 820px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
+        .status-bar { height: 96px; display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 16px; padding: 12px 20px; border-top: 1px solid var(--line); background: #101820; color: #f4f7f8; }
+        .status-bar strong { display: block; font-size: 12px; color: #9fd7cc; margin-bottom: 4px; }
+        .status-bar p { margin: 0; font-size: 13px; color: #e1e7ea; }
+        @media (max-width: 920px) {
+          body { overflow: auto; }
+          main { grid-template-columns: 1fr; height: auto; }
+          section.workspace { grid-template-rows: auto auto; }
+          aside { border-right: 0; border-bottom: 1px solid var(--line); }
+          .job-board, .status-bar { grid-template-columns: 1fr; }
+          .status-bar { height: auto; }
+          .manual-download .settings { grid-template-columns: 1fr; }
+        }
       </style>
     </head>
     <body>
       <header>
-        <h1>tiddl desktop</h1>
-        <span class="muted">Personal Tidal downloader</span>
+        <h1>Psybots Tiddl</h1>
+        <span class="muted">Autor: Psybots · Aplicacion ejecutable local</span>
       </header>
       <main>
         <aside>
           <div hx-get="/partials/session" hx-trigger="load" hx-swap="outerHTML"></div>
           <section class="panel">
-            <form class="inline" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
-              <input name="resource" placeholder="track/123, album/123 or playlist/uuid">
-              <button class="primary">Download</button>
+            <form class="manual-download" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
+              <h2>Descarga directa</h2>
+              <div class="settings">
+                <input name="resource" placeholder="track/123, album/123 or playlist/uuid">
+                <select name="track_quality" title="Calidad de streaming de audio">
+                  {quality_options(CONFIG.download.track_quality)}
+                </select>
+                <select name="video_quality" title="Calidad de streaming de video">
+                  {video_quality_options(CONFIG.download.video_quality)}
+                </select>
+                <select name="output_format">
+                  <option value="raw">RAW</option>
+                  <option value="wav">WAV</option>
+                  <option value="mp3_320">MP3 320</option>
+                </select>
+                <input name="concurrency" type="number" min="1" max="3" value="3" title="Descargas paralelas">
+                <button class="primary">Descargar</button>
+              </div>
             </form>
           </section>
           <section>
             <h2>Favorites</h2>
             <div class="tabs">
               <button hx-get="/partials/library?kind=playlist" hx-target="#library">Playlists</button>
-              <button hx-get="/partials/library?kind=album" hx-target="#library">Albums</button>
+              <button hx-get="/partials/library?kind=album" hx-target="#library">Albumes</button>
               <button hx-get="/partials/library?kind=track" hx-target="#library">Tracks</button>
             </div>
             <div id="library" hx-get="/partials/library?kind=playlist" hx-trigger="load">
@@ -669,13 +1042,38 @@ def page() -> str:
             </div>
           </section>
         </aside>
-        <section class="content">
-          <h2>Queue</h2>
-          <div hx-get="/partials/jobs" hx-trigger="load, every 2s" hx-target="#jobs" hx-swap="outerHTML">
-            <section id="jobs" class="jobs"><p class="muted">No downloads queued.</p></section>
-          </div>
+        <section class="workspace">
+          <section class="preview-pane">
+            <div id="preview">
+              <section class="preview-card">
+                <div class="preview-head">
+                  <div>
+                    <h2>Vista previa</h2>
+                    <p class="muted">Haz click en una playlist, album o track para ver su contenido aqui.</p>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </section>
+          <section class="queue-pane">
+            <h2>Descargas</h2>
+            <div hx-get="/partials/jobs" hx-trigger="load, every 2s" hx-target="#jobs" hx-swap="outerHTML">
+              <section id="jobs" class="job-board">
+                <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
+                <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
+                <div class="job-column"><h3>Errores</h3><p class="muted">Sin errores.</p></div>
+              </section>
+            </div>
+          </section>
         </section>
       </main>
+      <div hx-get="/partials/status" hx-trigger="load, every 2s" hx-target="#status-bar" hx-swap="outerHTML">
+        <section id="status-bar" class="status-bar">
+          <div><strong>Terminal</strong><p>Sin actividad</p></div>
+          <div><strong>Descarga actual</strong><p>Ninguna</p></div>
+          <div><strong>Progreso</strong><p>0 activas · 0 en cola · 0 completas · 0 errores</p></div>
+        </section>
+      </div>
     </body>
     </html>
     """
@@ -715,8 +1113,23 @@ def wait_for_port(host: str, port: int, timeout: float = 10) -> None:
     raise RuntimeError(f"Server did not start on {host}:{port}")
 
 
+def port_is_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return sock.connect_ex((host, port)) != 0
+
+
+def choose_port(host: str, preferred_port: int) -> int:
+    for port in range(preferred_port, preferred_port + 20):
+        if port_is_available(host, port):
+            return port
+
+    raise RuntimeError("No local port available for the desktop app")
+
+
 def run_desktop(host: str = "127.0.0.1", port: int = 8765, browser: bool = False) -> None:
     app = create_app()
+    port = choose_port(host, port)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -739,6 +1152,16 @@ def run_desktop(host: str = "127.0.0.1", port: int = 8765, browser: bool = False
         thread.join()
         return
 
-    webview.create_window("tiddl desktop", f"http://{host}:{port}", width=1180, height=760)
-    webview.start()
-    server.should_exit = True
+    try:
+        webview.create_window(
+            "Psybots Tiddl",
+            f"http://{host}:{port}",
+            width=1240,
+            height=820,
+        )
+        webview.start()
+    except Exception:
+        webbrowser.open(f"http://{host}:{port}")
+        thread.join()
+    finally:
+        server.should_exit = True

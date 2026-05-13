@@ -41,6 +41,36 @@ video_qualities_color: dict[StreamVideoQuality, str] = {
 }
 
 
+def get_track_quality_fallbacks(
+    item: Track, requested_quality: TrackQuality
+) -> list[TrackQuality]:
+    tags = item.mediaMetadata.tags
+    has_hires = "HIRES_LOSSLESS" in tags
+    has_lossless = has_hires or "LOSSLESS" in tags or item.audioQuality in [
+        "LOSSLESS",
+        "HI_RES_LOSSLESS",
+    ]
+
+    match requested_quality:
+        case "HI_RES_LOSSLESS":
+            if has_hires:
+                return ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "LOW"]
+            if has_lossless:
+                return ["LOSSLESS", "HIGH", "LOW"]
+            return ["HIGH", "LOW"]
+
+        case "LOSSLESS":
+            if has_lossless:
+                return ["LOSSLESS", "HIGH", "LOW"]
+            return ["HIGH", "LOW"]
+
+        case "HIGH":
+            return ["HIGH", "LOW"]
+
+        case "LOW":
+            return ["LOW"]
+
+
 class Downloader:
     api: TidalAPI
     rich_output: RichOutput
@@ -143,31 +173,43 @@ class Downloader:
 
         async with self.semaphore:
             if isinstance(item, Track):
-                try:
-                    stream = self.api.get_track_stream(
-                        track_id=item.id, quality=self.track_quality
-                    )
+                stream = None
+                stream_error: ApiError | None = None
 
-                    log.debug(
-                        f"{stream.trackId=}, {stream.audioQuality=}, {stream.audioMode=}"
-                    )
-
-                    if (
-                        self.dolby_atmos_filter == "none"
-                        and stream.audioMode == "DOLBY_ATMOS"
-                    ) or (
-                        self.dolby_atmos_filter == "only"
-                        and stream.audioMode == "STEREO"
-                    ):
-                        self.rich_output.console.print(
-                            f"[blue]Skipping[/] [gray]{item.title}[/] [blue]due to Dolby Atmos filter[/] {self.dolby_atmos_filter}"
+                for quality in get_track_quality_fallbacks(item, self.track_quality):
+                    try:
+                        stream = self.api.get_track_stream(
+                            track_id=item.id, quality=quality
                         )
-                        return None, False
+                        if quality != self.track_quality:
+                            self.rich_output.console.print(
+                                f"[yellow]Fallback[/] {item.title}: {self.track_quality} -> {quality}"
+                            )
+                        break
+                    except ApiError as e:
+                        stream_error = e
+                        log.warning(f"{item.id=} {quality=} {e=}")
 
-                except ApiError as e:
-                    log.error(f"{item.id=} {e=}")
+                if stream is None:
+                    log.error(f"{item.id=} {stream_error=}")
                     self.rich_output.console.print(
-                        f"[red]Error [{vibrant_color}]{item.title}[/] - {e.user_message}"
+                        f"[red]Error [{vibrant_color}]{item.title}[/] - {stream_error.user_message if stream_error else 'No stream available'}"
+                    )
+                    return None, False
+
+                log.debug(
+                    f"{stream.trackId=}, {stream.audioQuality=}, {stream.audioMode=}"
+                )
+
+                if (
+                    self.dolby_atmos_filter == "none"
+                    and stream.audioMode == "DOLBY_ATMOS"
+                ) or (
+                    self.dolby_atmos_filter == "only"
+                    and stream.audioMode == "STEREO"
+                ):
+                    self.rich_output.console.print(
+                        f"[blue]Skipping[/] [gray]{item.title}[/] [blue]due to Dolby Atmos filter[/] {self.dolby_atmos_filter}"
                     )
                     return None, False
 
