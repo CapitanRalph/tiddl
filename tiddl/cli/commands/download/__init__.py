@@ -481,7 +481,9 @@ def download_callback(
                     futures = []
 
                     while True:
-                        mix_items = ctx.obj.api.get_mix_items(resource.id, offset=0)
+                        mix_items = ctx.obj.api.get_mix_items(
+                            resource.id, offset=offset
+                        )
 
                         for mix_item in mix_items.items:
                             template = TEMPLATE or CONFIG.templates.mix

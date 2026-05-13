@@ -1,7 +1,5 @@
 from datetime import datetime
 
-import pytest
-
 from tiddl.core.utils.format import AlbumTemplate, format_template, generate_template_data
 from tiddl.core.api.models.resources import Video
 

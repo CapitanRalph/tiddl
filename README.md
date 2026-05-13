@@ -126,6 +126,31 @@ Music
 > [!NOTE]
 > Learn more about [file templating](/docs/templating.md)
 
+## Desktop app
+
+For a local desktop-like experience, run:
+
+```bash
+tiddl desktop
+```
+
+This starts a FastAPI + HTMX interface in a native webview window. It reuses the
+same trusted-device session as the CLI, lets you sign in with Tidal device login,
+lists favorite playlists/albums/tracks, accepts Tidal URLs or `track/123` style
+IDs, and shows a simple download queue.
+
+If your system cannot open a native webview, use the browser fallback:
+
+```bash
+tiddl desktop --browser
+```
+
+> [!NOTE]
+> Spanish summary: esta interfaz es para uso personal/local. Sirve para mostrar
+> arquitectura backend, autenticacion persistente, API integration, descarga
+> concurrente, manejo de archivos y una UI operativa sin convertir el proyecto
+> en un producto distribuido.
+
 ## Configuration files
 
 Files of the app are created in your home directory. By default, the app is located at `~/.tiddl`.
