@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiddl"
-version = "3.4.3"
+version = "1.1.4"
 description = "Download Tidal tracks with CLI downloader."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,8 +20,10 @@ dependencies = [
   "fastapi>=0.121.0",
   "m3u8>=6.0.0",
   "mutagen>=1.47.0",
+  "PySide6>=6.8.0",
   "python-multipart>=0.0.20",
   "pywebview>=6.0",
+  "qtpy>=2.4.0",
   "pydantic>=2.12.4",
   "requests>=2.32.5",
   "requests-cache>=1.2.1",

@@ -21,6 +21,8 @@ from tiddl.core.api.models import (
     Favorites,
     TrackLyrics,
     PlaylistItems,
+    UserAndFavoritePlaylists,
+    UserPlaylists,
     MixItems,
     Search,
     SessionResponse,
@@ -115,6 +117,26 @@ def test_get_favorites(api: TidalAPI, mock_client: MockType):
         Favorites,
         "users/u123/favorites/ids",
         {"countryCode": "US"},
+        expire_after=EXPIRE_IMMEDIATELY,
+    )
+
+
+def test_get_user_playlists(api: TidalAPI, mock_client: MockType):
+    api.get_user_playlists()
+    mock_client.fetch.assert_called_once_with(
+        UserPlaylists,
+        "users/u123/playlists",
+        {"countryCode": "US", "limit": Limits.USER_PLAYLISTS, "offset": 0},
+        expire_after=EXPIRE_IMMEDIATELY,
+    )
+
+
+def test_get_user_and_favorite_playlists(api: TidalAPI, mock_client: MockType):
+    api.get_user_and_favorite_playlists()
+    mock_client.fetch.assert_called_once_with(
+        UserAndFavoritePlaylists,
+        "users/u123/playlistsAndFavoritePlaylists",
+        {"countryCode": "US", "limit": Limits.USER_PLAYLISTS, "offset": 0},
         expire_after=EXPIRE_IMMEDIATELY,
     )
 

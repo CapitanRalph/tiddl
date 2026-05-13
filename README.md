@@ -3,6 +3,8 @@
 Descarga tracks y videos desde Tidal en la mejor calidad disponible. `tiddl` es
 una aplicación CLI y desktop local escrita en Python.
 
+Versión visible actual: `v1.1.4`.
+
 > [!WARNING]
 > `Esta aplicación es solo para uso personal y no está afiliada a Tidal. Cada usuario debe asegurarse de que su uso cumpla con los términos de servicio de Tidal y con las leyes locales de copyright. Los tracks descargados son para uso personal y no deben compartirse ni redistribuirse. El desarrollador no asume responsabilidad por el uso indebido de esta herramienta.`
 
@@ -75,6 +77,7 @@ Verifica la instalación:
 
 ```bash
 tiddl --help
+tiddl --version
 tiddl desktop --browser
 ```
 
@@ -86,6 +89,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv tool install "git+https://github.com/CapitanRalph/tiddl.git"
 tiddl --help
+tiddl --version
 ```
 
 ### Arch Linux
@@ -96,6 +100,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv tool install "git+https://github.com/CapitanRalph/tiddl.git"
 tiddl --help
+tiddl --version
 ```
 
 ## macOS
@@ -117,6 +122,7 @@ Verifica la instalación:
 
 ```bash
 tiddl --help
+tiddl --version
 tiddl desktop
 ```
 
@@ -153,6 +159,7 @@ Verifica la instalación:
 
 ```powershell
 tiddl --help
+tiddl --version
 tiddl desktop
 ```
 
@@ -290,6 +297,8 @@ tiddl desktop
 Esto inicia una interfaz FastAPI + HTMX en una ventana nativa con webview.
 Reutiliza la misma sesión confiable que la CLI, permite iniciar sesión con el
 flujo device login de Tidal y muestra `Autor: Psybots` en la interfaz.
+La versión visible se muestra en el encabezado del front y también puede
+consultarse con `tiddl --version` o `tiddl-desktop --version`.
 
 La app permite:
 
@@ -297,7 +306,8 @@ La app permite:
 - Hacer click en una playlist o álbum para ver una vista previa de su contenido
   en el panel derecho.
 - Descargar con salida `RAW`, `WAV` o `MP3 320`.
-- Configurar descargas paralelas entre 1 y 3 canciones al mismo tiempo.
+- Descargar en paralelo automáticamente: 1 canción para tracks sueltos y hasta
+  3 canciones para álbumes/playlists.
 - Ver una barra inferior con información de terminal, descarga actual y progreso.
 - Revisar descargas en cola, descargas completadas y errores.
 
@@ -319,6 +329,12 @@ tiddl desktop --browser
 > útiles para portfolio: arquitectura backend, autenticación persistente,
 > integración con API externa, descarga concurrente, manejo de archivos y una UI
 > operativa sin convertir el proyecto en un producto distribuido.
+
+## Versionado
+
+El proyecto usa una versión visible con formato `vMAJOR.MINOR.PATCH`, definida
+en `tiddl/version.py`. Cada cambio funcional o de interfaz debe actualizar esa
+versión para confirmar fácilmente que se está ejecutando la última build.
 
 ## Archivos de configuración
 

@@ -1,5 +1,6 @@
 import typer
 from typing_extensions import Annotated
+from tiddl.version import APP_VERSION
 
 desktop_command = typer.Typer(
     name="desktop",
@@ -12,6 +13,12 @@ def _run_desktop(host: str, port: int, browser: bool) -> None:
     from tiddl.web import run_desktop
 
     run_desktop(host=host, port=port, browser=browser)
+
+
+def version_callback(value: bool | None):
+    if value:
+        typer.echo(APP_VERSION)
+        raise typer.Exit()
 
 
 @desktop_command.callback(invoke_without_command=True)
@@ -31,6 +38,15 @@ def desktop(
             help="Run in the browser instead of the native webview window.",
         ),
     ] = False,
+    version: Annotated[
+        bool | None,
+        typer.Option(
+            "--version",
+            callback=version_callback,
+            is_eager=True,
+            help="Show version and exit.",
+        ),
+    ] = None,
 ):
     """
     Start a local FastAPI + HTMX interface for trusted-device downloads.

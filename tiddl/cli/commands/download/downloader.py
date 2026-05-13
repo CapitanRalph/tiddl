@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 from logging import getLogger
 from pathlib import Path
@@ -246,17 +247,33 @@ class Downloader:
             )
 
             download_path.parent.mkdir(exist_ok=True, parents=True)
+            tmp_name: str | None = None
 
             # TODO shouldnt session be reused instead of
             # creating new one on every download?
 
-            with NamedTemporaryFile(
-                "wb", delete=False, dir=download_path.parent
-            ) as tmp:
+            try:
+                with NamedTemporaryFile(
+                    "wb", delete=False, dir=download_path.parent
+                ) as tmp:
+                    tmp_name = tmp.name
+
                 async with aiohttp.ClientSession(trust_env=True) as session:
-                    async with aiofiles.open(tmp.name, "wb") as f:
+                    async with aiofiles.open(tmp_name, "wb") as f:
                         for url in urls:
                             async with session.get(url) as resp:
+                                if resp.status >= 400:
+                                    body = await resp.text()
+                                    log.error(
+                                        "download http error item_id=%s title=%s status=%s url=%s body=%s",
+                                        item.id,
+                                        item.title,
+                                        resp.status,
+                                        url,
+                                        body[:500],
+                                    )
+                                    resp.raise_for_status()
+
                                 async for chunk in resp.content.iter_chunked(
                                     CHUNK_SIZE
                                 ):
@@ -265,29 +282,55 @@ class Downloader:
                                         task_id, size=len(chunk)
                                     )
 
-            shutil.move(tmp.name, download_path)
+                shutil.move(tmp_name, download_path)
+                tmp_name = None
 
-            try:
-                download_path.chmod(0o644)
-            except OSError:
-                pass
+                try:
+                    download_path.chmod(0o644)
+                except OSError:
+                    pass
 
-            try:
-                if isinstance(item, Track) and should_extract_flac:
-                    download_path = extract_flac(download_path)
-                elif isinstance(item, Video):
-                    download_path = convert_to_mp4(download_path)
-            except Exception as exc:
-                log.error(f"{should_extract_flac=}, {exc=}")
+                try:
+                    if isinstance(item, Track) and should_extract_flac:
+                        download_path = extract_flac(download_path)
+                    elif isinstance(item, Video):
+                        download_path = convert_to_mp4(download_path)
+                except Exception as exc:
+                    log.exception(
+                        "postprocess failed item_id=%s title=%s path=%s should_extract_flac=%s",
+                        item.id,
+                        item.title,
+                        download_path,
+                        should_extract_flac,
+                    )
+                    raise exc
 
-            task = self.rich_output.download_finish(
-                task_id=task_id,
-            )
+                task = self.rich_output.download_finish(
+                    task_id=task_id,
+                )
 
-            self.rich_output.show_item_result(
-                result_message=result_message,
-                item_description=task.description,
-                item_path=download_path,
-            )
+                self.rich_output.show_item_result(
+                    result_message=result_message,
+                    item_description=task.description,
+                    item_path=download_path,
+                )
+
+            except Exception:
+                if tmp_name and os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        log.warning("could not remove temp download %s", tmp_name)
+                try:
+                    self.rich_output.download_finish(task_id=task_id)
+                except Exception:
+                    pass
+                log.exception(
+                    "download failed item_id=%s title=%s target=%s",
+                    item.id,
+                    item.title,
+                    download_path,
+                )
+                raise
 
             return download_path, True

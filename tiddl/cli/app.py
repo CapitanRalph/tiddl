@@ -7,13 +7,18 @@ from tiddl.cli.config import APP_PATH, CONFIG
 from tiddl.cli.ctx import ContextObject, Context
 from tiddl.cli.commands import register_commands
 from tiddl.core.utils.ffmpeg import is_ffmpeg_installed as ifs
+from tiddl.version import APP_VERSION
 
 log = logging.getLogger("tiddl")
 
 app = typer.Typer(name="tiddl", no_args_is_help=True, rich_markup_mode="rich")
 register_commands(app)
 
-VERSION = "v3.4.3"
+
+def version_callback(value: bool | None):
+    if value:
+        typer.echo(APP_VERSION)
+        raise typer.Exit()
 
 
 @app.callback()
@@ -31,15 +36,23 @@ def callback(
             "--debug",
         ),
     ] = CONFIG.debug,
+    VERSION: Annotated[
+        bool | None,
+        typer.Option(
+            "--version",
+            callback=version_callback,
+            is_eager=True,
+            help="Show version and exit.",
+        ),
+    ] = None,
 ):
     f"""
-    tiddl {VERSION} - download tidal tracks \u266b
+    tiddl {APP_VERSION} - download tidal tracks \u266b
 
-    [link=https://github.com/oskvr37/tiddl]github (https://github.com/oskvr37/tiddl)[/link]
-    [link=https://buymeacoffee.com/oskvr][yellow]buy me a coffee (https://buymeacoffee.com/oskvr)[/link]
+    [link=https://github.com/CapitanRalph/tiddl]github (https://github.com/CapitanRalph/tiddl)[/link]
     """
 
-    log.debug(f"{VERSION=}")
+    log.debug(f"{APP_VERSION=}")
     log.debug(f"{ctx.params=}")
 
     is_ffmpeg_installed = ifs()

@@ -15,6 +15,8 @@ from .models.base import (
     SessionResponse,
     TrackLyrics,
     TrackStream,
+    UserAndFavoritePlaylists,
+    UserPlaylists,
     VideoStream,
 )
 from .models.resources import (
@@ -48,6 +50,9 @@ class Limits:
 
     MIX_ITEMS = 20
     MIX_ITEMS_MAX = 100
+
+    USER_PLAYLISTS = 50
+    USER_PLAYLISTS_MAX = 100
 
 
 class TidalAPI:
@@ -170,6 +175,34 @@ class TidalAPI:
             Favorites,
             f"users/{self.user_id}/favorites/ids",
             {"countryCode": self.country_code},
+            expire_after=EXPIRE_IMMEDIATELY,
+        )
+
+    def get_user_playlists(
+        self, limit: int = Limits.USER_PLAYLISTS, offset: int = 0
+    ):
+        return self.client.fetch(
+            UserPlaylists,
+            f"users/{self.user_id}/playlists",
+            {
+                "countryCode": self.country_code,
+                "limit": min(limit, Limits.USER_PLAYLISTS_MAX),
+                "offset": offset,
+            },
+            expire_after=EXPIRE_IMMEDIATELY,
+        )
+
+    def get_user_and_favorite_playlists(
+        self, limit: int = Limits.USER_PLAYLISTS, offset: int = 0
+    ):
+        return self.client.fetch(
+            UserAndFavoritePlaylists,
+            f"users/{self.user_id}/playlistsAndFavoritePlaylists",
+            {
+                "countryCode": self.country_code,
+                "limit": min(limit, Limits.USER_PLAYLISTS_MAX),
+                "offset": offset,
+            },
             expire_after=EXPIRE_IMMEDIATELY,
         )
 

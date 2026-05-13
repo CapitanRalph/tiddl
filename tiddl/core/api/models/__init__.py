@@ -9,6 +9,8 @@ from .base import (
     SessionResponse,
     TrackLyrics,
     TrackStream,
+    UserAndFavoritePlaylists,
+    UserPlaylists,
     VideoStream,
 )
 from .resources import (
@@ -35,9 +37,11 @@ __all__ = [
     "Favorites",
     "TrackLyrics",
     "PlaylistItems",
+    "UserPlaylists",
+    "UserAndFavoritePlaylists",
     "MixItems",
     "Search",
     "SessionResponse",
     "TrackStream",
-    "VideoStream"
+    "VideoStream",
 ]
