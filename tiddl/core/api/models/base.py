@@ -171,9 +171,8 @@ class SearchArtist(BaseModel):  # search-specific, fewer required fields
     picture: Optional[str] = None
     popularity: Optional[int] = None
 
+
 class Search(BaseModel):
-
-
     class Artists(Items):
         items: List[SearchArtist]  # ← uses the inner model, not resources.Artist
 

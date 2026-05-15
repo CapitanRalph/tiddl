@@ -15,6 +15,8 @@ from tiddl.web.app import (
     format_bytes,
     get_all_web_playlists,
     page,
+    parse_supported_resource,
+    render_library,
     render_job,
     strip_rich,
     web_playlist_folder,
@@ -29,8 +31,8 @@ def test_session_panel_prompts_for_login(monkeypatch):
     response = client.get("/partials/session")
 
     assert response.status_code == 200
-    assert "Not signed in" in response.text
-    assert "Sign in" in response.text
+    assert "Conecta tu cuenta de TIDAL" in response.text
+    assert "Iniciar sesión" in response.text
 
 
 def test_jobs_panel_renders_empty_queue():
@@ -57,7 +59,7 @@ def test_jobs_panel_renders_existing_job():
 
     assert response.status_code == 200
     assert "track/123" in response.text
-    assert "1/2 items" in response.text
+    assert "1/2 ítems" in response.text
 
 
 def test_page_renders_direct_download_full_width():
@@ -65,6 +67,10 @@ def test_page_renders_direct_download_full_width():
 
     assert '<section class="direct-bar">' in html
     assert html.index("Descarga directa") < html.index("<main>")
+    assert "__TRACK_QUALITY_OPTIONS__" not in html
+    assert "HIGH - FLAC 16-bit/44.1 kHz" in html
+    assert "unpkg.com" not in html
+    assert "X-Requested-With" in html
 
 
 def test_job_card_renders_aligned_download_details():
@@ -79,7 +85,11 @@ def test_job_card_renders_aligned_download_details():
         target_path="/tmp/tiddl/playlist/My Playlist",
     )
     job.results.append(
-        JobResult(title="Track", path="/tmp/tiddl/playlist/My Playlist/001. Track.flac", status="Downloaded")
+        JobResult(
+            title="Track",
+            path="/tmp/tiddl/playlist/My Playlist/001. Track.flac",
+            status="Downloaded",
+        )
     )
 
     html = render_job(job)
@@ -104,8 +114,45 @@ def test_clamp_concurrency_limits_to_three():
     assert clamp_concurrency(9) == 3
 
 
+def test_parse_supported_resource_returns_friendly_error():
+    try:
+        parse_supported_resource("not-a-resource")
+    except ValueError as exc:
+        assert "track/123" in str(exc)
+    else:
+        raise AssertionError("Expected invalid resources to raise ValueError")
+
+
+def test_create_job_invalid_resource_renders_notice():
+    client = TestClient(create_app(WebState()))
+    response = client.post("/jobs", data={"resource": "not-a-resource"})
+
+    assert response.status_code == 200
+    assert "No se pudo iniciar" in response.text
+    assert "track/123" in response.text
+
+
+def test_create_job_requires_session(monkeypatch):
+    monkeypatch.setattr("tiddl.web.app.load_auth_data", lambda: AuthData())
+
+    client = TestClient(create_app(WebState()))
+    response = client.post("/jobs", data={"resource": "track/123"})
+
+    assert response.status_code == 200
+    assert "Inicia sesión con TIDAL" in response.text
+
+
+def test_preview_invalid_resource_renders_message():
+    client = TestClient(create_app(WebState()))
+    response = client.get("/partials/preview?resource=not-a-resource")
+
+    assert response.status_code == 200
+    assert "Recurso no válido" in response.text
+    assert "track/123" in response.text
+
+
 def test_web_playlist_folder_is_sanitized():
-    playlist = SimpleNamespace(title='My: Playlist / 2026.', uuid="uuid")
+    playlist = SimpleNamespace(title="My: Playlist / 2026.", uuid="uuid")
 
     assert web_playlist_folder(playlist).as_posix() == "playlist/My Playlist 2026"
     assert clean_path_segment("...") == "_"
@@ -150,12 +197,39 @@ def test_get_all_web_playlists_paginates_and_deduplicates():
         ],
     )
     api = SimpleNamespace(
-        get_user_and_favorite_playlists=lambda offset=0: first if offset == 0 else second
+        get_user_and_favorite_playlists=lambda offset=0: (
+            first if offset == 0 else second
+        )
     )
 
     playlists = get_all_web_playlists(api)
 
     assert [playlist.uuid for playlist in playlists] == ["one", "two", "three"]
+
+
+def test_render_library_limits_track_favorites_for_fast_initial_load():
+    favorites = SimpleNamespace(
+        model_dump=lambda: {
+            "TRACK": [str(index) for index in range(55)],
+            "ALBUM": [],
+            "PLAYLIST": [],
+        }
+    )
+
+    def get_track(resource_id):
+        return SimpleNamespace(
+            id=resource_id,
+            title=f"Track {resource_id}",
+            artist=SimpleNamespace(name="Artist"),
+        )
+
+    api = SimpleNamespace(get_favorites=lambda: favorites, get_track=get_track)
+
+    html = render_library(api, "track")
+
+    assert "Mostrando 50 de 55 canciones" in html
+    assert "Track 49" in html
+    assert "Track 54" not in html
 
 
 def test_finalize_job_without_files_marks_failed():
@@ -169,23 +243,42 @@ def test_finalize_job_without_files_marks_failed():
 
 def test_finalize_job_with_file_marks_done():
     job = DownloadJob(id="abc", resource="playlist/test")
-    job.results.append(JobResult(title="Track", path="/tmp/track.flac", status="Downloaded"))
+    job.results.append(
+        JobResult(title="Track", path="/tmp/track.flac", status="Downloaded")
+    )
 
     finalize_job(job)
 
     assert job.status == "done"
-    assert "1 files" in job.message
+    assert "1 archivo" in job.message
 
 
 def test_finalize_job_with_skipped_items_keeps_successful_job_done():
     job = DownloadJob(id="abc", resource="playlist/test")
-    job.results.append(JobResult(title="Track", path="/tmp/track.flac", status="Downloaded"))
-    job.results.append(JobResult(title="Video", path="", status="Skipped filtrado"))
+    job.results.append(
+        JobResult(title="Track", path="/tmp/track.flac", status="Downloaded")
+    )
+    job.results.append(JobResult(title="Video", path="", status="Omitido: filtrado"))
 
     finalize_job(job)
 
     assert job.status == "done"
-    assert "1 files" in job.message
+    assert "1 archivo" in job.message
+
+
+def test_render_job_progress_is_clamped():
+    job = DownloadJob(
+        id="abc",
+        resource="track/123",
+        status="running",
+        message="Downloading",
+        total=1,
+        completed=3,
+    )
+
+    html = render_job(job)
+
+    assert "width: 100%" in html
 
 
 def make_track() -> Track:

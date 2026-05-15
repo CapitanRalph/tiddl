@@ -4,7 +4,7 @@ from tiddl.version import APP_VERSION
 
 desktop_command = typer.Typer(
     name="desktop",
-    help="Run the local desktop-like web app.",
+    help="Run the local desktop app.",
     no_args_is_help=False,
 )
 
@@ -49,7 +49,7 @@ def desktop(
     ] = None,
 ):
     """
-    Start a local FastAPI + HTMX interface for trusted-device downloads.
+    Start the native desktop window for trusted-device downloads.
     """
 
     _run_desktop(host=host, port=port, browser=browser)

@@ -122,9 +122,9 @@ def _display_name(item) -> str:
     if isinstance(item, SearchArtist):
         return item.name
     elif isinstance(item, Video):
-        return f"{item.artist or item.artists[0].name or ""} - {item.title}"
+        return f"{item.artist or item.artists[0].name or ''} - {item.title}"
     elif isinstance(item, (Track, Album)):
-        return f"{item.artist or item.artists[0].name or ""} - {item.title} [blue][{', '.join(item.audioModes)}][/]"
+        return f"{item.artist or item.artists[0].name or ''} - {item.title} [blue][{', '.join(item.audioModes)}][/]"
     elif isinstance(item, (Playlist)):
         return item.title
     else:

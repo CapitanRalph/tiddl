@@ -47,10 +47,15 @@ def get_track_quality_fallbacks(
 ) -> list[TrackQuality]:
     tags = item.mediaMetadata.tags
     has_hires = "HIRES_LOSSLESS" in tags
-    has_lossless = has_hires or "LOSSLESS" in tags or item.audioQuality in [
-        "LOSSLESS",
-        "HI_RES_LOSSLESS",
-    ]
+    has_lossless = (
+        has_hires
+        or "LOSSLESS" in tags
+        or item.audioQuality
+        in [
+            "LOSSLESS",
+            "HI_RES_LOSSLESS",
+        ]
+    )
 
     match requested_quality:
         case "HI_RES_LOSSLESS":
@@ -206,8 +211,7 @@ class Downloader:
                     self.dolby_atmos_filter == "none"
                     and stream.audioMode == "DOLBY_ATMOS"
                 ) or (
-                    self.dolby_atmos_filter == "only"
-                    and stream.audioMode == "STEREO"
+                    self.dolby_atmos_filter == "only" and stream.audioMode == "STEREO"
                 ):
                     self.rich_output.console.print(
                         f"[blue]Skipping[/] [gray]{item.title}[/] [blue]due to Dolby Atmos filter[/] {self.dolby_atmos_filter}"

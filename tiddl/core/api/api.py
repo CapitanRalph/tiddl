@@ -178,9 +178,7 @@ class TidalAPI:
             expire_after=EXPIRE_IMMEDIATELY,
         )
 
-    def get_user_playlists(
-        self, limit: int = Limits.USER_PLAYLISTS, offset: int = 0
-    ):
+    def get_user_playlists(self, limit: int = Limits.USER_PLAYLISTS, offset: int = 0):
         return self.client.fetch(
             UserPlaylists,
             f"users/{self.user_id}/playlists",

@@ -33,6 +33,7 @@ from tiddl.version import APP_VERSION
 
 ResourceKind = Literal["track", "album", "playlist"]
 AudioOutputFormat = Literal["raw", "wav", "mp3_320"]
+WEB_FAVORITES_LIMIT = 50
 log = logging.getLogger("tiddl.web")
 
 
@@ -42,7 +43,7 @@ class LoginAttempt:
     uri: str
     expires_at: float
     status: str = "pending"
-    message: str = "Waiting for authorization"
+    message: str = "Esperando autorización"
 
 
 @dataclass
@@ -62,7 +63,7 @@ class DownloadJob:
     video_quality: VIDEO_QUALITY_LITERAL = "fhd"
     target_path: str = ""
     status: str = "queued"
-    message: str = "Queued"
+    message: str = "En cola"
     total: int = 0
     completed: int = 0
     bytes_downloaded: int = 0
@@ -147,7 +148,7 @@ class WebOutput:
         self.job.active_items[task_id] = clean_description
         self.job.status = "running"
         self.job.message = clean_description
-        self.job.terminal.append(f"Starting {clean_description}")
+        self.job.terminal.append(f"Iniciando {clean_description}")
         log.info("job=%s start item=%s", self.job.id, clean_description)
         return task_id
 
@@ -167,30 +168,29 @@ class WebOutput:
     def show_item_result(
         self, result_message: str, item_description: str, item_path: Path | None
     ) -> None:
+        status = display_result_status(result_message)
         self.job.results.append(
             JobResult(
                 title=strip_rich(item_description),
                 path=str(item_path) if item_path else "",
-                status=strip_rich(result_message),
+                status=status,
             )
         )
-        self.job.terminal.append(
-            f"{strip_rich(result_message)} {strip_rich(item_description)}"
-        )
+        self.job.terminal.append(f"{status} {strip_rich(item_description)}")
         self.job.terminal = self.job.terminal[-40:]
         log.info(
             "job=%s result=%s item=%s path=%s",
             self.job.id,
-            strip_rich(result_message),
+            status,
             strip_rich(item_description),
             item_path,
         )
 
     def show_item_skipped(self, item: Track | Video, reason: str) -> None:
         self.job.results.append(
-            JobResult(title=item.title, path="", status=f"Skipped {reason}")
+            JobResult(title=item.title, path="", status=f"Omitido: {reason}")
         )
-        self.job.terminal.append(f"Skipped {item.title}: {reason}")
+        self.job.terminal.append(f"Omitido {item.title}: {reason}")
         self.job.terminal = self.job.terminal[-40:]
         log.info(
             "job=%s skipped item_id=%s title=%s reason=%s",
@@ -256,7 +256,14 @@ def create_app(state: WebState | None = None) -> FastAPI:
 
     @app.post("/auth/start", response_class=HTMLResponse)
     def auth_start() -> str:
-        device_auth = web_state.auth_api.get_device_auth()
+        try:
+            device_auth = web_state.auth_api.get_device_auth()
+        except Exception as exc:
+            log.exception("could not start auth")
+            return render_session_error(
+                f"No pudimos iniciar sesión con TIDAL: {friendly_error(exc)}"
+            )
+
         uri = f"https://{device_auth.verificationUriComplete}"
         attempt = LoginAttempt(
             id=uuid4().hex,
@@ -278,12 +285,20 @@ def create_app(state: WebState | None = None) -> FastAPI:
 
     @app.post("/auth/refresh", response_class=HTMLResponse)
     def auth_refresh() -> str:
-        ensure_fresh_auth(web_state.auth_api, force=True)
-        return render_session_panel(web_state)
+        try:
+            ensure_fresh_auth(web_state.auth_api, force=True)
+            return render_session_panel(web_state)
+        except Exception as exc:
+            log.exception("could not refresh auth")
+            return render_session_error(
+                f"No pudimos actualizar la sesión: {friendly_error(exc)}"
+            )
 
     @app.post("/auth/logout", response_class=HTMLResponse)
     def auth_logout() -> str:
         save_auth_data(AuthData())
+        with web_state.lock:
+            web_state.login_attempt = None
         return render_session_panel(web_state)
 
     @app.get("/auth/status", response_class=HTMLResponse)
@@ -300,20 +315,40 @@ def create_app(state: WebState | None = None) -> FastAPI:
     @app.get("/partials/library", response_class=HTMLResponse)
     def library(kind: ResourceKind = "playlist") -> str:
         if not web_state.authenticated():
-            return '<p class="muted">Sign in to load your Tidal favorites.</p>'
+            return (
+                '<p class="muted">Inicia sesión para cargar tu biblioteca de TIDAL.</p>'
+            )
 
-        api = web_state.api()
-        return render_library(api, kind)
+        try:
+            api = web_state.api()
+            return render_library(api, kind)
+        except Exception as exc:
+            log.exception("could not render library kind=%s", kind)
+            return render_inline_error(
+                f"No pudimos cargar la biblioteca: {friendly_error(exc)}"
+            )
 
     @app.get("/partials/preview", response_class=HTMLResponse)
     def preview(resource: str) -> str:
-        api = web_state.api()
         try:
             tidal_resource = parse_supported_resource(resource)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return render_preview_message("Recurso no válido", str(exc))
 
-        return render_preview(api, tidal_resource)
+        if not web_state.authenticated():
+            return render_preview_message(
+                "Sesión requerida",
+                "Inicia sesión con TIDAL para revisar este recurso.",
+            )
+
+        try:
+            api = web_state.api()
+            return render_preview(api, tidal_resource)
+        except Exception as exc:
+            log.exception("could not render preview resource=%s", tidal_resource)
+            return render_preview_message(
+                "No pudimos cargar la vista previa", friendly_error(exc)
+            )
 
     @app.post("/jobs", response_class=HTMLResponse)
     def create_job(
@@ -322,11 +357,25 @@ def create_app(state: WebState | None = None) -> FastAPI:
         track_quality: TRACK_QUALITY_LITERAL = Form("high"),
         video_quality: VIDEO_QUALITY_LITERAL = Form("fhd"),
     ) -> str:
-        api = web_state.api()
         try:
             tidal_resource = parse_supported_resource(resource.strip())
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return render_jobs(web_state, notice=str(exc))
+
+        if not web_state.authenticated():
+            return render_jobs(
+                web_state,
+                notice="Inicia sesión con TIDAL antes de iniciar una descarga.",
+            )
+
+        try:
+            api = web_state.api()
+        except Exception as exc:
+            log.exception("could not create api for job resource=%s", tidal_resource)
+            return render_jobs(
+                web_state,
+                notice=f"No pudimos preparar la descarga: {friendly_error(exc)}",
+            )
 
         concurrency = auto_concurrency(tidal_resource)
 
@@ -388,11 +437,13 @@ def poll_auth(
         except AuthClientError as exc:
             if exc.error == "authorization_pending":
                 remaining = max(0, int(attempt.expires_at - time.time()))
-                attempt.message = f"Waiting for authorization ({remaining}s left)"
+                attempt.message = f"Esperando autorización ({remaining}s restantes)"
                 continue
 
             attempt.status = "failed"
-            attempt.message = exc.error_description or exc.error or "Authorization failed"
+            attempt.message = (
+                exc.error_description or exc.error or "No se pudo autorizar"
+            )
             return
 
         save_auth_data(
@@ -405,11 +456,11 @@ def poll_auth(
             )
         )
         attempt.status = "complete"
-        attempt.message = "Signed in"
+        attempt.message = "Sesión iniciada"
         return
 
     attempt.status = "expired"
-    attempt.message = "Authorization expired"
+    attempt.message = "La autorización expiró"
 
 
 def ensure_fresh_auth(auth_api: AuthAPI, force: bool = False) -> AuthData:
@@ -430,12 +481,30 @@ def ensure_fresh_auth(auth_api: AuthAPI, force: bool = False) -> AuthData:
 
 
 def parse_supported_resource(resource: str) -> TidalResource:
-    tidal_resource = TidalResource.from_string(resource)
+    if not resource.strip():
+        raise ValueError("Ingresa un recurso para descargar.")
+
+    try:
+        tidal_resource = TidalResource.from_string(resource)
+    except ValueError as exc:
+        raise ValueError(
+            "Ingresa un recurso válido: track/123, album/123 o playlist/uuid."
+        ) from exc
 
     if tidal_resource.type not in ("track", "album", "playlist"):
-        raise ValueError("La aplicacion soporta tracks, albumes y playlists.")
+        raise ValueError("La aplicación soporta canciones, álbumes y playlists.")
 
     return tidal_resource
+
+
+def friendly_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+
+    if isinstance(exc, ApiError):
+        return exc.user_message
+
+    return str(exc) or exc.__class__.__name__
 
 
 def clamp_concurrency(value: int) -> int:
@@ -484,10 +553,10 @@ def run_download_job(
 ) -> None:
     try:
         job.status = "running"
-        job.message = "Preparing download"
+        job.message = "Preparando descarga"
         job.target_path = str(CONFIG.download.download_path)
         job.terminal.append(
-            f"Queued {resource} as {output_format.upper()} with {concurrency} automatic workers"
+            f"En cola {resource} como {output_format.upper()} con {concurrency} descarga(s) en paralelo"
         )
         log.info(
             "job=%s resource=%s output=%s audio=%s video=%s concurrency=%s download_path=%s log=%s",
@@ -513,7 +582,9 @@ def run_download_job(
         )
         if job.status != "failed":
             finalize_job(job)
-            log.info("job=%s finished status=%s message=%s", job.id, job.status, job.message)
+            log.info(
+                "job=%s finished status=%s message=%s", job.id, job.status, job.message
+            )
     except Exception as exc:
         job.status = "failed"
         job.error = str(exc)
@@ -633,21 +704,21 @@ async def download_resource(
                 MetadataPayload(
                     date=str(album.releaseDate or ""),
                     artist=album.artist.name if album.artist else "",
-                    cover=Cover(album.cover) if album.cover and CONFIG.metadata.cover else None,
+                    cover=Cover(album.cover)
+                    if album.cover and CONFIG.metadata.cover
+                    else None,
                 ),
             )
 
         case "album":
             album = api.get_album(resource.id)
-            await download_album(
-                api, album, handle_item, track_quality, video_quality
-            )
+            await download_album(api, album, handle_item, track_quality, video_quality)
 
         case "playlist":
             playlist = api.get_playlist(resource.id)
             playlist_folder = web_playlist_folder(playlist)
             job.target_path = str(CONFIG.download.download_path / playlist_folder)
-            job.terminal.append(f"Playlist target: {job.target_path}")
+            job.terminal.append(f"Destino de playlist: {job.target_path}")
             log.info(
                 "job=%s playlist=%s playlist_title=%s target=%s",
                 job.id,
@@ -665,7 +736,10 @@ async def download_resource(
                     playlist_index += 1
                     item = playlist_item.item
                     album = None
-                    if isinstance(item, Track) and "{album" in CONFIG.templates.playlist:
+                    if (
+                        isinstance(item, Track)
+                        and "{album" in CONFIG.templates.playlist
+                    ):
                         try:
                             album = api.get_album(item.album.id)
                         except ApiError:
@@ -717,9 +791,7 @@ def web_playlist_item_filename(
             album=album,
             playlist=playlist,
             playlist_index=playlist_index,
-            quality=get_item_quality(
-                item, track_quality, video_quality
-            ),
+            quality=get_item_quality(item, track_quality, video_quality),
             with_asterisk_ext=False,
         )
     )
@@ -799,44 +871,52 @@ def convert_track_output(path: Path, output_format: AudioOutputFormat) -> Path:
 
 def render_library(api: TidalAPI, kind: ResourceKind) -> str:
     rows = []
+    total_count = 0
 
     if kind == "playlist":
         playlists = get_all_web_playlists(api)
+        total_count = len(playlists)
         for item in playlists:
             title = item.title
-            meta = f"{item.numberOfTracks} tracks · {item.numberOfVideos} videos"
+            meta = f"{item.numberOfTracks} canciones · {item.numberOfVideos} videos"
             resource = f"playlist/{item.uuid}"
             rows.append(resource_row(kind, title, meta, resource))
     else:
         favorites = api.get_favorites()
         ids = favorites.model_dump()[kind.upper()]
+        total_count = len(ids)
 
-        for resource_id in ids:
+        for resource_id in ids[:WEB_FAVORITES_LIMIT]:
             try:
                 match kind:
                     case "album":
                         item = api.get_album(resource_id)
                         title = item.title
-                        meta = item.artist.name if item.artist else "Album"
+                        meta = item.artist.name if item.artist else "Álbum"
                         resource = f"album/{item.id}"
                     case "track":
                         item = api.get_track(resource_id)
                         title = item.title
-                        meta = item.artist.name if item.artist else "Track"
+                        meta = item.artist.name if item.artist else "Canción"
                         resource = f"track/{item.id}"
                     case _:
                         continue
             except Exception:
+                log.exception(
+                    "could not load favorite kind=%s resource_id=%s",
+                    kind,
+                    resource_id,
+                )
                 continue
 
             rows.append(resource_row(kind, title, meta, resource))
 
     if not rows:
-        return '<p class="muted">No favorites found for this type.</p>'
+        return '<p class="muted">No hay favoritos guardados en esta categoría.</p>'
 
     return f"""
     <div class="library-list">
-      <p class="muted list-count">{len(rows)} {escape(kind)} encontrados</p>
+      <p class="muted list-count">{escape(library_count_label(kind, len(rows), total_count))}</p>
       {"".join(rows)}
     </div>
     """
@@ -873,7 +953,7 @@ def render_preview(api: TidalAPI, resource: TidalResource) -> str:
                 for index, item in enumerate(items.items)
             ]
             title = playlist.title
-            meta = f"{playlist.numberOfTracks} tracks · {playlist.numberOfVideos} videos"
+            meta = f"{playlist.numberOfTracks} canciones · {playlist.numberOfVideos} videos"
 
         case "album":
             album = api.get_album(resource.id)
@@ -883,13 +963,13 @@ def render_preview(api: TidalAPI, resource: TidalResource) -> str:
                 for index, item in enumerate(items.items)
             ]
             title = album.title
-            artist = album.artist.name if album.artist else "Album"
-            meta = f"{artist} · {album.numberOfTracks} tracks"
+            artist = album.artist.name if album.artist else "Álbum"
+            meta = f"{artist} · {album.numberOfTracks} canciones"
 
         case "track":
             track = api.get_track(resource.id)
             title = track.title
-            artist = track.artist.name if track.artist else "Track"
+            artist = track.artist.name if track.artist else "Canción"
             meta = f"{artist} · {track.audioQuality} · {track.duration}s"
             rows = [preview_item_row(1, track)]
 
@@ -919,10 +999,10 @@ def render_session_panel(state: WebState) -> str:
         return """
         <section class="panel" id="session-panel">
           <div>
-            <h2>Session</h2>
-            <p class="muted">Not signed in. Start device login to trust this machine.</p>
+            <h2>Sesión</h2>
+            <p class="muted">Conecta tu cuenta de TIDAL para ver favoritos y descargar.</p>
           </div>
-          <button class="primary" hx-post="/auth/start" hx-target="#session-panel" hx-swap="outerHTML">Sign in</button>
+          <button class="primary" hx-post="/auth/start" hx-target="#session-panel" hx-swap="outerHTML">Iniciar sesión</button>
         </section>
         """
 
@@ -930,12 +1010,12 @@ def render_session_panel(state: WebState) -> str:
     return f"""
     <section class="panel" id="session-panel">
       <div>
-        <h2>Session</h2>
-        <p class="muted">Signed in as user {escape(auth_data.user_id or "")} · {escape(auth_data.country_code or "")} · token expires in {expires}m</p>
+        <h2>Sesión activa</h2>
+        <p class="muted">Usuario {escape(auth_data.user_id or "")} · {escape(auth_data.country_code or "")} · expira en {expires} min</p>
       </div>
       <div class="actions">
-        <button hx-post="/auth/refresh" hx-target="#session-panel" hx-swap="outerHTML">Refresh</button>
-        <button hx-post="/auth/logout" hx-target="#session-panel" hx-swap="outerHTML">Forget</button>
+        <button hx-post="/auth/refresh" hx-target="#session-panel" hx-swap="outerHTML">Actualizar</button>
+        <button hx-post="/auth/logout" hx-target="#session-panel" hx-swap="outerHTML">Cerrar sesión</button>
       </div>
     </section>
     """
@@ -945,61 +1025,110 @@ def render_login_attempt(attempt: LoginAttempt) -> str:
     return f"""
     <section class="panel" id="session-panel" hx-get="/auth/status" hx-trigger="every 3s" hx-swap="outerHTML">
       <div>
-        <h2>Session</h2>
+        <h2>Sesión</h2>
         <p class="muted">{escape(attempt.message)}</p>
-        <a class="link" href="{escape(attempt.uri)}" target="_blank">Open Tidal authorization</a>
+        <a class="link" href="{escape(attempt.uri)}" target="_blank">Abrir autorización de TIDAL</a>
       </div>
     </section>
     """
 
 
-def render_jobs(state: WebState) -> str:
-    jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
-    if not jobs:
-        return """
-        <section id="jobs" class="job-board">
-          <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
-          <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
-          <div class="job-column"><h3>Errores</h3><p class="muted">Sin errores.</p></div>
-        </section>
-        """
-
-    queued = [job for job in jobs if job.status in ("queued", "running")]
-    done = [job for job in jobs if job.status == "done" and not has_job_errors(job)]
-    failed = [
-        job for job in jobs if job.status == "failed" or has_job_errors(job)
-    ]
+def render_session_error(message: str) -> str:
     return f"""
-    <section id="jobs" class="job-board">
-      {render_job_column("En cola", queued)}
-      {render_job_column("Completadas", done)}
-      {render_job_column("Errores", failed)}
+    <section class="panel" id="session-panel">
+      <div>
+        <h2>Sesión</h2>
+        <p class="error">{escape(message)}</p>
+      </div>
+      <button class="primary" hx-post="/auth/start" hx-target="#session-panel" hx-swap="outerHTML">Reintentar</button>
     </section>
     """
 
 
-def render_job_column(title: str, jobs: list[DownloadJob]) -> str:
+def render_inline_error(message: str) -> str:
+    return f'<p class="error">{escape(message)}</p>'
+
+
+def render_preview_message(title: str, message: str) -> str:
+    return f"""
+    <section class="preview-card">
+      <div class="preview-head">
+        <div>
+          <h2>{escape(title)}</h2>
+          <p class="error">{escape(message)}</p>
+        </div>
+      </div>
+    </section>
+    """
+
+
+def render_jobs(state: WebState, notice: str = "") -> str:
+    jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
     if not jobs:
+        notice_html = (
+            render_job_notice(notice) if notice else '<p class="muted">Sin errores.</p>'
+        )
+        return """
+        <section id="jobs" class="job-board">
+          <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
+          <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
+          <div class="job-column"><h3>Errores</h3>__NOTICE__</div>
+        </section>
+        """.replace("__NOTICE__", notice_html)
+
+    queued = [job for job in jobs if job.status in ("queued", "running")]
+    done = [job for job in jobs if job.status == "done" and not has_job_errors(job)]
+    failed = [job for job in jobs if job.status == "failed" or has_job_errors(job)]
+    return f"""
+    <section id="jobs" class="job-board">
+      {render_job_column("En cola", queued)}
+      {render_job_column("Completadas", done)}
+      {render_job_column("Errores", failed, render_job_notice(notice) if notice else "")}
+    </section>
+    """
+
+
+def render_job_column(title: str, jobs: list[DownloadJob], extra: str = "") -> str:
+    if not jobs and not extra:
         return f'<div class="job-column"><h3>{escape(title)}</h3><p class="muted">Sin registros.</p></div>'
 
     rows = [render_job(job) for job in jobs[:12]]
-    return f'<div class="job-column"><h3>{escape(title)}</h3>{"".join(rows)}</div>'
+    return (
+        f'<div class="job-column"><h3>{escape(title)}</h3>{"".join(rows)}{extra}</div>'
+    )
+
+
+def render_job_notice(message: str) -> str:
+    if not message:
+        return ""
+
+    return f"""
+    <article class="job notice-job">
+      <div class="job-top">
+        <div>
+          <strong>No se pudo iniciar</strong>
+          <p class="error">{escape(message)}</p>
+        </div>
+        <span class="badge failed">Error</span>
+      </div>
+    </article>
+    """
 
 
 def has_job_errors(job: DownloadJob) -> bool:
-    return any(result.status.startswith("Error") for result in job.results)
+    return any(is_error_status(result.status) for result in job.results)
 
 
 def successful_result_count(job: DownloadJob) -> int:
     return sum(
         1
         for result in job.results
-        if result.path and not result.status.startswith("Error")
+        if result.path and not is_error_status(result.status)
     )
 
 
 def skipped_result_count(job: DownloadJob) -> int:
-    return sum(1 for result in job.results if result.status.startswith("Skipped"))
+    return sum(1 for result in job.results if is_skipped_status(result.status))
 
 
 def finalize_job(job: DownloadJob) -> None:
@@ -1011,20 +1140,21 @@ def finalize_job(job: DownloadJob) -> None:
             "No se descargó ningún archivo. Revisa filtros, calidad seleccionada, "
             "disponibilidad regional o si la playlist contiene solo videos."
         )
-        job.message = "Finished without downloadable files"
+        job.message = "Finalizada sin archivos descargables"
         job.terminal.append(job.error)
         log.error("job=%s finished without files results=%s", job.id, job.results)
         return
 
     job.status = "done"
     if has_job_errors(job):
-        job.message = f"Finished with errors ({successes} files)"
+        job.message = f"Finalizada con errores ({format_file_count(successes)})"
     else:
-        job.message = f"Finished ({successes} files)"
+        job.message = f"Finalizada ({format_file_count(successes)})"
 
 
 def render_job(job: DownloadJob) -> str:
     percent = int((job.completed / job.total) * 100) if job.total else 0
+    percent = max(0, min(100, percent))
     results = "".join(render_job_result(result) for result in job.results[-5:])
     error = f'<p class="error">{escape(job.error)}</p>' if job.error else ""
     target_path = job.target_path or str(CONFIG.download.download_path)
@@ -1037,13 +1167,13 @@ def render_job(job: DownloadJob) -> str:
           <strong>{escape(job.resource)}</strong>
           <p class="muted">{escape(job.message)}</p>
         </div>
-        <span class="badge {escape(job.status)}">{escape(job.status)}</span>
+        <span class="badge {escape(job.status)}">{escape(job_status_label(job.status))}</span>
       </div>
       <div class="meter"><span style="width: {percent}%"></span></div>
       <dl class="job-facts">
-        <div><dt>Progreso</dt><dd>{job.completed}/{job.total or '?'} items{warning_text}</dd></div>
+        <div><dt>Progreso</dt><dd>{job.completed}/{job.total or "?"} ítems{warning_text}</dd></div>
         <div><dt>Datos</dt><dd>{format_bytes(job.bytes_downloaded)}</dd></div>
-        <div><dt>Salida</dt><dd>{escape(job.output_format.upper())}</dd></div>
+        <div><dt>Formato</dt><dd>{escape(job.output_format.upper())}</dd></div>
         <div><dt>Audio</dt><dd>{escape(job.track_quality.upper())}</dd></div>
         <div><dt>Video</dt><dd>{escape(job.video_quality.upper())}</dd></div>
         <div><dt>Paralelo</dt><dd>{job.concurrency}x auto</dd></div>
@@ -1053,7 +1183,7 @@ def render_job(job: DownloadJob) -> str:
         <code>{escape(target_path)}</code>
         <form hx-post="/open-folder" hx-target="#status-bar" hx-swap="outerHTML">
           <input type="hidden" name="path" value="{escape(target_path)}">
-          <button>Abrir</button>
+          <button>Abrir carpeta</button>
         </form>
       </div>
       {error}
@@ -1087,9 +1217,9 @@ def resource_row(kind: str, title: str, meta: str, resource: str) -> str:
     <button class="resource-row" hx-get="/partials/preview?resource={escape(resource)}" hx-target="#preview" hx-swap="innerHTML">
       <div class="resource-main">
         <strong>{escape(title)}</strong>
-        <p class="muted">{escape(kind.title())} · {escape(meta)}</p>
+        <p class="muted">{escape(resource_kind_label(kind))} · {escape(meta)}</p>
       </div>
-      <span>Ver</span>
+      <span>Revisar</span>
     </button>
     """
 
@@ -1097,7 +1227,7 @@ def resource_row(kind: str, title: str, meta: str, resource: str) -> str:
 def preview_item_row(index: int, item: Track | Video) -> str:
     artist = item.artist.name if item.artist else ""
     if isinstance(item, Track):
-        detail = f"{artist} · track {item.trackNumber} · {item.audioQuality}"
+        detail = f"{artist} · canción {item.trackNumber} · {item.audioQuality}"
         resource = f"track/{item.id}"
     else:
         detail = f"{artist} · video · {item.quality}"
@@ -1133,16 +1263,66 @@ def download_form(resource: str, compact: bool) -> str:
         </select>
       </label>
       <label>
-        <span>Salida</span>
+        <span>Formato</span>
         <select name="output_format">
           <option value="raw">RAW</option>
           <option value="wav">WAV</option>
           <option value="mp3_320">MP3 320</option>
         </select>
       </label>
-      <button class="primary">Descargar</button>
+      <button class="primary">Iniciar descarga</button>
     </form>
     """
+
+
+def resource_kind_label(kind: str, plural: bool = False) -> str:
+    labels = {
+        "playlist": ("Playlist", "playlists"),
+        "album": ("Álbum", "álbumes"),
+        "track": ("Canción", "canciones"),
+    }
+    singular_label, plural_label = labels.get(kind, (kind.title(), f"{kind}s"))
+    return plural_label if plural else singular_label
+
+
+def library_count_label(kind: str, visible: int, total: int) -> str:
+    label = resource_kind_label(kind, plural=True)
+    if total and visible < total:
+        return f"Mostrando {visible} de {total} {label}"
+
+    return f"{visible} {label}"
+
+
+def job_status_label(status: str) -> str:
+    labels = {
+        "queued": "En cola",
+        "running": "En curso",
+        "done": "Completada",
+        "failed": "Error",
+    }
+    return labels.get(status, status)
+
+
+def display_result_status(status: str) -> str:
+    clean_status = strip_rich(status).strip()
+    labels = {
+        "Downloaded": "Descargado",
+        "Overwrited": "Sobrescrito",
+        "Exists": "Ya existía",
+    }
+    return labels.get(clean_status, clean_status)
+
+
+def is_error_status(status: str) -> bool:
+    return status.startswith("Error")
+
+
+def is_skipped_status(status: str) -> bool:
+    return status.startswith("Skipped") or status.startswith("Omitido")
+
+
+def format_file_count(count: int) -> str:
+    return f"{count} archivo" if count == 1 else f"{count} archivos"
 
 
 def quality_options(selected: TRACK_QUALITY_LITERAL) -> str:
@@ -1230,40 +1410,156 @@ def page() -> str:
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>Psybots Tiddl __APP_VERSION__</title>
-      <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+      <script>
+        (() => {
+          const escapeHtml = (value) => String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+
+          const everyDelay = (trigger) => {
+            const match = trigger.match(/every\\s+([0-9.]+)s/);
+            return match ? Number(match[1]) * 1000 : 0;
+          };
+
+          const swapHtml = (target, html, mode) => {
+            if (!target) return null;
+            if (mode === "outerHTML") {
+              const template = document.createElement("template");
+              template.innerHTML = html.trim();
+              const next = template.content.firstElementChild;
+              if (!next) return null;
+              target.replaceWith(next);
+              bind(next);
+              return next;
+            }
+
+            target.innerHTML = html;
+            bind(target);
+            return target;
+          };
+
+          const request = async (el, method, url, body = null) => {
+            const targetSelector = el.getAttribute("hx-target");
+            const target = targetSelector ? document.querySelector(targetSelector) : el;
+            const swapMode = el.getAttribute("hx-swap") || "innerHTML";
+            el.setAttribute("aria-busy", "true");
+
+            try {
+              const response = await fetch(url, {
+                method,
+                body,
+                headers: { "X-Requested-With": "tiddl-desktop" },
+              });
+              const html = await response.text();
+              if (!response.ok) {
+                throw new Error(html || response.statusText);
+              }
+              swapHtml(target, html, swapMode);
+            } catch (error) {
+              const message = escapeHtml(error.message || error);
+              const html = `<p class="error">No se pudo completar la solicitud. ${message}</p>`;
+              if (target) {
+                target.insertAdjacentHTML("afterbegin", html);
+              }
+            } finally {
+              el.removeAttribute("aria-busy");
+            }
+          };
+
+          const initTrigger = (el) => {
+            if (el.dataset.hxBound === "true") return;
+            el.dataset.hxBound = "true";
+            const trigger = el.getAttribute("hx-trigger") || "";
+            const url = el.getAttribute("hx-get");
+            if (!url) return;
+
+            if (trigger.includes("load")) {
+              request(el, "GET", url);
+            }
+
+            const delay = everyDelay(trigger);
+            if (delay > 0) {
+              const interval = window.setInterval(() => {
+                if (!document.documentElement.contains(el)) {
+                  window.clearInterval(interval);
+                  return;
+                }
+                request(el, "GET", url);
+              }, delay);
+            }
+          };
+
+          const bind = (root = document) => {
+            if (root.matches && root.matches("[hx-trigger]")) {
+              initTrigger(root);
+            }
+            root.querySelectorAll?.("[hx-trigger]").forEach(initTrigger);
+          };
+
+          document.addEventListener("submit", (event) => {
+            const form = event.target.closest("form[hx-post]");
+            if (!form) return;
+            event.preventDefault();
+            request(form, "POST", form.getAttribute("hx-post"), new FormData(form));
+          });
+
+          document.addEventListener("click", (event) => {
+            const el = event.target.closest("[hx-get], [hx-post]");
+            if (!el || el.closest("form")) return;
+            event.preventDefault();
+            if (el.hasAttribute("hx-get")) {
+              request(el, "GET", el.getAttribute("hx-get"));
+            } else {
+              request(el, "POST", el.getAttribute("hx-post"));
+            }
+          });
+
+          document.addEventListener("DOMContentLoaded", () => bind(document));
+        })();
+      </script>
       <style>
-        :root { color-scheme: light; --ink: #172026; --muted: #65717a; --line: #d9dee3; --panel: #f7f8fa; --accent: #0f7b68; --danger: #ad3030; --warn: #9c6a12; }
+        :root { color-scheme: light; --ink: #182128; --muted: #64717b; --line: #d8dee4; --panel: #f5f7f9; --accent: #0b806c; --accent-hover: #086c5c; --danger: #b43a3a; --warn: #966813; --focus: #82cfc1; }
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; color: var(--ink); overflow: hidden; }
-        header { height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--line); background: #fbfbfc; }
-        .direct-bar { padding: 12px 20px; border-bottom: 1px solid var(--line); background: #fff; }
-        main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); height: calc(100vh - 222px); }
+        html { height: 100%; background: #101820; }
+        body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; min-height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; color: var(--ink); overflow: hidden; }
+        header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 20px; border-bottom: 1px solid var(--line); background: #fbfbfc; }
+        .app-subtitle { text-align: right; }
+        .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: #fff; }
+        main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; }
         aside { border-right: 1px solid var(--line); padding: 12px; background: var(--panel); overflow: auto; }
         section.workspace { display: grid; grid-template-rows: minmax(280px, 1fr) minmax(210px, 34vh); min-height: 0; }
         section.preview-pane, section.queue-pane { padding: 16px; overflow: auto; }
         section.preview-pane { border-bottom: 1px solid var(--line); }
-        h1 { font-size: 18px; margin: 0; }
+        h1 { font-size: 18px; line-height: 1.2; margin: 0; white-space: nowrap; }
         .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--accent); background: #fff; vertical-align: middle; }
-        h2 { font-size: 15px; margin: 0 0 6px; }
-        h3 { font-size: 13px; margin: 0 0 8px; }
-        .muted { color: var(--muted); margin: 0; font-size: 13px; }
+        h2 { font-size: 16px; line-height: 1.25; margin: 0 0 6px; }
+        h3 { font-size: 13px; line-height: 1.3; margin: 0 0 8px; }
+        .muted { color: var(--muted); margin: 0; font-size: 13px; line-height: 1.45; }
         .panel { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; border: 1px solid var(--line); background: #fff; border-radius: 8px; margin-bottom: 10px; }
         .actions, .tabs, form.inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        button, input, select { height: 36px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); padding: 0 10px; font: inherit; }
+        button, input, select { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); padding: 0 10px; font: inherit; font-size: 14px; }
         input { min-width: 0; width: 100%; }
-        button { cursor: pointer; }
+        button { cursor: pointer; font-weight: 600; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+        button:hover { border-color: #aab6bf; background: #f6f8fa; }
+        [aria-busy="true"] { cursor: progress; opacity: .72; }
+        button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
         button.primary { background: var(--accent); color: white; border-color: var(--accent); }
-        .tabs button { min-width: 82px; }
-        .link { color: var(--accent); font-size: 13px; }
+        button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+        .tabs button { min-width: 86px; }
+        .link { color: var(--accent); font-size: 13px; font-weight: 600; }
         .library-list { display: grid; gap: 2px; margin-top: 8px; }
         .list-count { padding: 4px 2px 6px; }
         .resource-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 10px 0; }
-        .resource-row { width: 100%; height: auto; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 9px 2px; }
+        .resource-row { width: 100%; min-height: 48px; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 9px 2px; }
         .resource-main { min-width: 0; }
         .resource-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .resource-row:hover { background: #eef6f4; padding-left: 8px; padding-right: 8px; border-radius: 6px; }
+        .resource-row > span { flex: 0 0 auto; color: var(--accent); font-size: 12px; font-weight: 700; }
+        .resource-row:hover { background: #eef7f5; padding-left: 8px; padding-right: 8px; border-radius: 6px; }
         .preview-card { border: 1px solid var(--line); border-radius: 8px; background: #fff; }
         .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 14px; border-bottom: 1px solid var(--line); }
+        .preview-head > div { min-width: 0; }
         .track-list { padding: 0 14px 6px; }
         .track-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center; }
         .download-form, .compact-form { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
@@ -1273,14 +1569,15 @@ def page() -> str:
         .compact-form label:nth-of-type(2) select { width: 120px; }
         .manual-download { display: grid; gap: 8px; width: 100%; }
         .manual-download h2 { margin-bottom: 0; }
-        .manual-download .settings { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(170px, 220px) minmax(130px, 180px) minmax(110px, 140px) auto; gap: 8px; align-items: end; }
+        .manual-download .settings { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(190px, 240px) minmax(140px, 190px) minmax(120px, 150px) auto; gap: 8px; align-items: end; }
         .manual-download label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
         .job-board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
         .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
         .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
         .job-top > div { min-width: 0; }
         .job-top strong { overflow-wrap: anywhere; }
-        .badge { font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; text-transform: uppercase; }
+        .notice-job { border-bottom: 0; padding-bottom: 0; }
+        .badge { flex: 0 0 auto; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; }
         .badge.done { color: var(--accent); border-color: var(--accent); }
         .badge.failed { color: var(--danger); border-color: var(--danger); }
         .badge.running { color: var(--warn); border-color: var(--warn); }
@@ -1301,12 +1598,20 @@ def page() -> str:
         .error { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
         .status-bar { height: 96px; display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 16px; padding: 12px 20px; border-top: 1px solid var(--line); background: #101820; color: #f4f7f8; }
         .status-bar strong { display: block; font-size: 12px; color: #9fd7cc; margin-bottom: 4px; }
-        .status-bar p { margin: 0; font-size: 13px; color: #e1e7ea; }
+        .status-bar p { margin: 0; font-size: 13px; line-height: 1.45; color: #e1e7ea; overflow-wrap: anywhere; }
         @media (max-width: 920px) {
-          body { overflow: auto; }
+          body { display: block; height: auto; overflow: auto; }
+          header { align-items: flex-start; flex-direction: column; gap: 4px; padding: 10px 20px; }
+          h1 { white-space: normal; }
+          .app-subtitle { text-align: left; }
           main { grid-template-columns: 1fr; height: auto; }
           section.workspace { grid-template-rows: auto auto; }
           aside { border-right: 0; border-bottom: 1px solid var(--line); }
+          .panel, .preview-head { align-items: stretch; flex-direction: column; }
+          .download-form, .compact-form { display: grid; grid-template-columns: 1fr; }
+          .download-form select, .compact-form select, .compact-form label:first-of-type select, .compact-form label:nth-of-type(2) select { width: 100%; }
+          .track-row { grid-template-columns: 34px 1fr; }
+          .track-row form { grid-column: 1 / -1; }
           .job-board, .status-bar { grid-template-columns: 1fr; }
           .status-bar { height: auto; }
           .manual-download .settings { grid-template-columns: 1fr; }
@@ -1317,7 +1622,7 @@ def page() -> str:
     <body>
       <header>
         <h1>Psybots Tiddl <span class="version-badge">__APP_VERSION__</span></h1>
-        <span class="muted">Autor: Psybots · Aplicacion ejecutable local · __APP_VERSION__</span>
+        <span class="muted app-subtitle">Autor: Psybots · Aplicación de escritorio local · __APP_VERSION__</span>
       </header>
       <section class="direct-bar">
         <form class="manual-download" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
@@ -1325,29 +1630,29 @@ def page() -> str:
           <div class="settings">
             <label>
               <span>Recurso</span>
-              <input name="resource" placeholder="track/123, album/123 or playlist/uuid">
+              <input name="resource" placeholder="track/123, album/123 o playlist/uuid">
             </label>
             <label>
               <span>Calidad audio</span>
               <select name="track_quality" title="Calidad de streaming de audio">
-                {quality_options(CONFIG.download.track_quality)}
+                __TRACK_QUALITY_OPTIONS__
               </select>
             </label>
             <label>
               <span>Calidad video</span>
               <select name="video_quality" title="Calidad de streaming de video">
-                {video_quality_options(CONFIG.download.video_quality)}
+                __VIDEO_QUALITY_OPTIONS__
               </select>
             </label>
             <label>
-              <span>Salida</span>
+              <span>Formato</span>
               <select name="output_format">
                 <option value="raw">RAW</option>
                 <option value="wav">WAV</option>
                 <option value="mp3_320">MP3 320</option>
               </select>
             </label>
-            <button class="primary">Descargar</button>
+            <button class="primary">Iniciar descarga</button>
           </div>
         </form>
       </section>
@@ -1355,14 +1660,14 @@ def page() -> str:
         <aside>
           <div hx-get="/partials/session" hx-trigger="load" hx-swap="outerHTML"></div>
           <section>
-            <h2>Favorites</h2>
+            <h2>Biblioteca</h2>
             <div class="tabs">
               <button hx-get="/partials/library?kind=playlist" hx-target="#library">Playlists</button>
-              <button hx-get="/partials/library?kind=album" hx-target="#library">Albumes</button>
-              <button hx-get="/partials/library?kind=track" hx-target="#library">Tracks</button>
+              <button hx-get="/partials/library?kind=album" hx-target="#library">Álbumes</button>
+              <button hx-get="/partials/library?kind=track" hx-target="#library">Canciones</button>
             </div>
             <div id="library" hx-get="/partials/library?kind=playlist" hx-trigger="load">
-              <p class="muted">Loading favorites...</p>
+              <p class="muted">Cargando biblioteca...</p>
             </div>
           </section>
         </aside>
@@ -1373,7 +1678,7 @@ def page() -> str:
                 <div class="preview-head">
                   <div>
                     <h2>Vista previa</h2>
-                    <p class="muted">Haz click en una playlist, album o track para ver su contenido aqui.</p>
+                    <p class="muted">Selecciona una playlist, álbum o canción para revisar su contenido antes de descargar.</p>
                   </div>
                 </div>
               </section>
@@ -1401,7 +1706,16 @@ def page() -> str:
     </body>
     </html>
     """
-    return html.replace("__APP_VERSION__", APP_VERSION)
+    return (
+        html.replace("__APP_VERSION__", APP_VERSION)
+        .replace(
+            "__TRACK_QUALITY_OPTIONS__", quality_options(CONFIG.download.track_quality)
+        )
+        .replace(
+            "__VIDEO_QUALITY_OPTIONS__",
+            video_quality_options(CONFIG.download.video_quality),
+        )
+    )
 
 
 def strip_rich(value: str) -> str:
@@ -1452,7 +1766,9 @@ def choose_port(host: str, preferred_port: int) -> int:
     raise RuntimeError("No local port available for the desktop app")
 
 
-def run_desktop(host: str = "127.0.0.1", port: int = 8765, browser: bool = False) -> None:
+def run_desktop(
+    host: str = "127.0.0.1", port: int = 8765, browser: bool = False
+) -> None:
     app = create_app()
     port = choose_port(host, port)
 

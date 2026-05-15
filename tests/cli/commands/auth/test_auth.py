@@ -50,7 +50,6 @@ def test_login_success(monkeypatch: pytest.MonkeyPatch):
         patch("tiddl.cli.commands.auth.time", side_effect=lambda: 1000),
         patch("tiddl.cli.commands.auth.sleep"),
     ):
-
         auth_api = MockAuthAPI.return_value
         auth_api.get_device_auth.return_value = device_auth_mock
         auth_api.get_auth.side_effect = [
@@ -90,7 +89,6 @@ def test_login_expired(monkeypatch: pytest.MonkeyPatch):
         patch("tiddl.cli.commands.auth.time", side_effect=lambda: 1000),
         patch("tiddl.cli.commands.auth.sleep"),
     ):
-
         auth_api = MockAuthAPI.return_value
         auth_api.get_device_auth.return_value = device_auth_mock
         auth_api.get_auth.side_effect = [
@@ -135,7 +133,9 @@ def test_logout_no_token(monkeypatch: pytest.MonkeyPatch):
         "tiddl.cli.commands.auth.load_auth_data", lambda: AuthData(token=None)
     )
 
-    with (patch("tiddl.cli.commands.auth.AuthAPI") as MockAuthAPI,):
+    with (
+        patch("tiddl.cli.commands.auth.AuthAPI") as MockAuthAPI,
+    ):
         result = runner.invoke(auth_command, ["logout"])
 
         MockAuthAPI.assert_not_called()
@@ -184,7 +184,6 @@ def test_logout_fails_without_force(monkeypatch: pytest.MonkeyPatch):
         patch("tiddl.cli.commands.auth.AuthAPI") as MockAuthAPI,
         patch("tiddl.cli.commands.auth.save_auth_data") as mock_save,
     ):
-
         MockAuthAPI.return_value.logout_token.side_effect = Exception("Error")
 
         result = runner.invoke(auth_command, ["logout"])
@@ -235,7 +234,6 @@ def test_refresh_success(monkeypatch: pytest.MonkeyPatch):
         patch("tiddl.cli.commands.auth.AuthAPI") as MockAuthAPI,
         patch("tiddl.cli.commands.auth.save_auth_data") as mock_save,
     ):
-
         MockAuthAPI.return_value.refresh_token.return_value = mock_auth_response
 
         result = runner.invoke(auth_command, ["refresh"])

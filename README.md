@@ -3,7 +3,8 @@
 Descarga tracks y videos desde Tidal en la mejor calidad disponible. `tiddl` es
 una aplicación CLI y desktop local escrita en Python.
 
-Versión visible actual: `v1.1.4`.
+La versión visible de CLI y desktop se toma automáticamente desde `pyproject.toml`.
+Las notas de actualización están en [`CHANGELOG.md`](CHANGELOG.md).
 
 > [!WARNING]
 > `Esta aplicación es solo para uso personal y no está afiliada a Tidal. Cada usuario debe asegurarse de que su uso cumpla con los términos de servicio de Tidal y con las leyes locales de copyright. Los tracks descargados son para uso personal y no deben compartirse ni redistribuirse. El desarrollador no asume responsabilidad por el uso indebido de esta herramienta.`
@@ -22,7 +23,7 @@ https://github.com/CapitanRalph/tiddl
 
 > [!NOTE]
 > La versión publicada en [PyPI](https://pypi.org/project/tiddl/) puede no incluir
-> los cambios de este fork, como la aplicación desktop con FastAPI + HTMX. Para
+> los cambios de este fork, como la aplicación desktop con FastAPI y UI local. Para
 > probar este proyecto tal como está documentado aquí, instala desde GitHub.
 
 > [!IMPORTANT]
@@ -211,7 +212,7 @@ $ tiddl
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Commands ──────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ auth       Manage Tidal authentication.                                                                     │
-│ desktop    Run the local desktop-like web app.                                                              │
+│ desktop    Run the local desktop app.                                                                       │
 │ download   Download Tidal resources.                                                                        │
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
@@ -294,7 +295,7 @@ También puedes abrirla desde la CLI principal:
 tiddl desktop
 ```
 
-Esto inicia una interfaz FastAPI + HTMX en una ventana nativa con webview.
+Esto inicia una interfaz FastAPI en una ventana nativa con webview.
 Reutiliza la misma sesión confiable que la CLI, permite iniciar sesión con el
 flujo device login de Tidal y muestra `Autor: Psybots` en la interfaz.
 La versión visible se muestra en el encabezado del front y también puede
@@ -333,8 +334,9 @@ tiddl desktop --browser
 ## Versionado
 
 El proyecto usa una versión visible con formato `vMAJOR.MINOR.PATCH`, definida
-en `tiddl/version.py`. Cada cambio funcional o de interfaz debe actualizar esa
-versión para confirmar fácilmente que se está ejecutando la última build.
+en `pyproject.toml` y leída automáticamente por `tiddl/version.py`. Cada cambio
+funcional, de interfaz o de documentación relevante debe actualizar esa versión
+para confirmar fácilmente que se está ejecutando la última build.
 
 ## Archivos de configuración
 

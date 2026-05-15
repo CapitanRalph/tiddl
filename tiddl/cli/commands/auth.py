@@ -20,9 +20,7 @@ auth_command = typer.Typer(
 def login(
     NO_BROWSER: Annotated[
         bool,
-        typer.Option(
-            "--no-browser", "-n", help="Do not open browser."
-        ),
+        typer.Option("--no-browser", "-n", help="Do not open browser."),
     ] = False,
 ):
     loaded_auth_data = load_auth_data()

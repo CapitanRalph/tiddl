@@ -6,9 +6,7 @@ from tiddl.core.api.models import Track
 log = getLogger(__name__)
 
 
-def save_tracks_to_m3u(
-    tracks_with_path: list[tuple[Path, Track]], path: Path
-):
+def save_tracks_to_m3u(tracks_with_path: list[tuple[Path, Track]], path: Path):
     """
     tracks_with_path: [track_path, Track]
     path: m3u file location

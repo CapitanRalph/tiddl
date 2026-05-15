@@ -37,7 +37,6 @@ JSON: TypeAlias = dict[str, Any]
 
 
 class AuthClient:
-
     def __init__(self) -> None:
         self.auth_url = AUTH_URL
         self.client_id = CLIENT_ID

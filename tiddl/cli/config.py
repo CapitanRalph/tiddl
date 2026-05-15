@@ -62,7 +62,10 @@ class Config(BaseModel):
 
         def model_post_init(self, __context):
             # set scan path to download path when download path is non default
-            if self.scan_path == DEFAULT_DOWNLOAD_PATH and self.download_path != DEFAULT_DOWNLOAD_PATH:
+            if (
+                self.scan_path == DEFAULT_DOWNLOAD_PATH
+                and self.download_path != DEFAULT_DOWNLOAD_PATH
+            ):
                 self.scan_path = self.download_path
 
         @field_validator("download_path", "scan_path", mode="before")

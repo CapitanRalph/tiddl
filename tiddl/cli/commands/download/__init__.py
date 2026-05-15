@@ -412,7 +412,6 @@ def download_callback(
             # then we would be able to reuse the logic in the export command
 
             match resource.type:
-
                 case "track":
                     track = ctx.obj.api.get_track(resource.id)
                     album = ctx.obj.api.get_album(track.album.id)

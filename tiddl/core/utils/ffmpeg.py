@@ -10,16 +10,14 @@ def run(cmd: list[str]) -> subprocess.CompletedProcess:
     """Run a process; raise `FFmpegError` on non-zero exit with stderr."""
     # Force UTF-8 encoding to prevent UnicodeDecodeError on Windows
     r = subprocess.run(
-        cmd, 
-        capture_output=True, 
-        text=True, 
-        encoding="utf-8", 
-        errors="replace"  # Added as a safety net
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",  # Added as a safety net
     )
     if r.returncode != 0:
-        raise FFmpegError(
-            f"{cmd[0]} failed (rc={r.returncode}): {r.stderr.strip()}"
-        )
+        raise FFmpegError(f"{cmd[0]} failed (rc={r.returncode}): {r.stderr.strip()}")
     return r
 
 
@@ -36,13 +34,20 @@ def is_ffmpeg_installed() -> bool:
 def _probe_audio_codec(source: Path) -> str:
     """Return first audio stream's codec_name, or "" if ffprobe is unavailable."""
     try:
-        r = run([
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(source),
-        ])
+        r = run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(source),
+            ]
+        )
         return r.stdout.strip()
     except (FileNotFoundError, FFmpegError):
         return ""
