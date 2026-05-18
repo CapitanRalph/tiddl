@@ -42,11 +42,11 @@ Cada version estable debe publicar assets preconstruidos:
 
 | Plataforma | Asset recomendado | Usuario objetivo |
 | --- | --- | --- |
-| macOS Apple Silicon | `Psybots-Tiddl-macOS-arm64.dmg` | Macs M1, M2, M3, M4 |
-| macOS Intel | `Psybots-Tiddl-macOS-x64.dmg` | Macs Intel |
-| Windows | `Psybots-Tiddl-Windows-x64-Setup.exe` | Windows 10/11 |
-| Linux | `Psybots-Tiddl-Linux-x64.AppImage` | Linux generico |
-| Linux Debian/Ubuntu | `psybot-tiddl_1.2.0_amd64.deb` | Ubuntu/Debian |
+| macOS Apple Silicon | `Tiddl-DDJ-macOS-arm64.dmg` | Macs M1, M2, M3, M4 |
+| macOS Intel | `Tiddl-DDJ-macOS-x64.dmg` | Macs Intel |
+| Windows | `Tiddl-DDJ-Windows-x64-Setup.exe` | Windows 10/11 |
+| Linux | `Tiddl-DDJ-Linux-x64.AppImage` | Linux generico |
+| Linux Debian/Ubuntu | `tiddl-ddj_1.2.0_amd64.deb` | Ubuntu/Debian |
 
 La pagina del release debe decir claramente:
 
@@ -142,13 +142,34 @@ Usar nombres predecibles facilita los scripts `install.sh` e `install.ps1`.
 Ejemplo para `v1.2.0`:
 
 ```text
-Psybots-Tiddl-v1.2.0-macOS-arm64.dmg
-Psybots-Tiddl-v1.2.0-macOS-x64.dmg
-Psybots-Tiddl-v1.2.0-Windows-x64-Setup.exe
-Psybots-Tiddl-v1.2.0-Linux-x64.AppImage
-psybot-tiddl_1.2.0_amd64.deb
+Tiddl-DDJ-v1.2.0-macOS-arm64.dmg
+Tiddl-DDJ-v1.2.0-macOS-x64.dmg
+Tiddl-DDJ-v1.2.0-Windows-x64-Setup.exe
+Tiddl-DDJ-v1.2.0-Linux-x64.AppImage
+tiddl-ddj_1.2.0_amd64.deb
 checksums.txt
 ```
+
+### Actualizaciones desde GitHub
+
+La app desktop revisa GitHub Releases desde el front y usa la version actual
+del paquete para decidir si hay una actualizacion disponible.
+
+Flujo esperado:
+
+1. Consultar `https://api.github.com/repos/CapitanRalph/tiddl/releases/latest`.
+2. Comparar `tag_name` contra `pyproject.toml`.
+3. Detectar plataforma: `macos-arm64`, `macos-x64`, `windows-x64`,
+   `linux-x64` o variantes arm64.
+4. Buscar un asset cuyo nombre contenga plataforma y arquitectura.
+5. Descargar el instalador a la carpeta local `updates`.
+6. Verificar SHA256 cuando GitHub entregue `digest`.
+7. Abrir el instalador del sistema y pedir al usuario cerrar Tiddl DDJ cuando
+   termine.
+
+Para que el updater funcione, cada release debe incluir assets con nombres como
+`Tiddl-DDJ-v1.2.0-Windows-x64-Setup.exe` o
+`Tiddl-DDJ-v1.2.0-macOS-arm64.pkg`.
 
 ## macOS
 
@@ -156,7 +177,7 @@ checksums.txt
 
 1. Usuario descarga `.dmg`.
 2. Abre el `.dmg`.
-3. Arrastra `Psybots Tiddl.app` a Applications.
+3. Arrastra `Tiddl DDJ.app` a Applications.
 4. Abre la app desde Launchpad o Applications.
 
 ### Requisitos para que no sea doloroso
@@ -186,7 +207,7 @@ Comando conceptual con PyInstaller:
 
 ```sh
 uv run pyinstaller \
-  --name "Psybots Tiddl" \
+  --name "Tiddl DDJ" \
   --windowed \
   --collect-all PySide6 \
   --collect-all pywebview \
@@ -210,9 +231,9 @@ MACOS_CERTIFICATE_PASSWORD
 Flujo conceptual:
 
 ```sh
-codesign --deep --force --options runtime --sign "Developer ID Application: ..." "Psybots Tiddl.app"
-xcrun notarytool submit "Psybots-Tiddl.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait
-xcrun stapler staple "Psybots-Tiddl.dmg"
+codesign --deep --force --options runtime --sign "Developer ID Application: ..." "Tiddl DDJ.app"
+xcrun notarytool submit "Tiddl-DDJ.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait
+xcrun stapler staple "Tiddl-DDJ.dmg"
 ```
 
 ### Instalador por terminal en macOS
@@ -243,7 +264,7 @@ x86_64 -> macOS-x64.dmg
 7. Mostrar:
 
 ```text
-Psybots Tiddl instalado.
+Tiddl DDJ instalado.
 Abre la app desde Applications.
 ```
 
@@ -254,10 +275,10 @@ usuarios.
 
 ### Experiencia ideal
 
-1. Usuario descarga `Psybots-Tiddl-Windows-x64-Setup.exe`.
+1. Usuario descarga `Tiddl-DDJ-Windows-x64-Setup.exe`.
 2. Lo ejecuta.
 3. El instalador crea acceso directo en el Menu Inicio.
-4. El usuario abre Psybots Tiddl.
+4. El usuario abre Tiddl DDJ.
 
 ### Instalador recomendado
 
@@ -285,7 +306,7 @@ WINDOWS_CERTIFICATE_PASSWORD
 Flujo conceptual:
 
 ```powershell
-signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f certificate.pfx /p "$env:WINDOWS_CERTIFICATE_PASSWORD" Psybots-Tiddl-Windows-x64-Setup.exe
+signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f certificate.pfx /p "$env:WINDOWS_CERTIFICATE_PASSWORD" Tiddl-DDJ-Windows-x64-Setup.exe
 ```
 
 ### Instalador por PowerShell
@@ -324,8 +345,8 @@ Ventajas:
 Comando para usuario:
 
 ```sh
-chmod +x Psybots-Tiddl-v1.2.0-Linux-x64.AppImage
-./Psybots-Tiddl-v1.2.0-Linux-x64.AppImage
+chmod +x Tiddl-DDJ-v1.2.0-Linux-x64.AppImage
+./Tiddl-DDJ-v1.2.0-Linux-x64.AppImage
 ```
 
 ### `.deb`
@@ -333,7 +354,7 @@ chmod +x Psybots-Tiddl-v1.2.0-Linux-x64.AppImage
 Para Ubuntu/Debian:
 
 ```sh
-sudo apt install ./psybot-tiddl_1.2.0_amd64.deb
+sudo apt install ./tiddl-ddj_1.2.0_amd64.deb
 ```
 
 ### Dependencias graficas
@@ -432,9 +453,9 @@ Debe tener mensajes humanos:
 
 ```text
 Detectamos macOS Apple Silicon.
-Descargando Psybots Tiddl...
+Descargando Tiddl DDJ...
 Instalando en ~/Applications...
-Listo. Abre Psybots Tiddl desde Applications.
+Listo. Abre Tiddl DDJ desde Applications.
 ```
 
 ### `install.ps1`

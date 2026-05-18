@@ -15,6 +15,14 @@ def test_missing_file_default_config(tmp_path: Path):
     cfg = load_config_file(cfg_file)
 
     assert isinstance(cfg, Config)
+    assert cfg.templates.track == (
+        "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - "
+        "{item.title_version}"
+    )
+    assert cfg.templates.playlist == (
+        "playlist/{playlist.title}/{playlist.index:03d} - {item.artist} - "
+        "{item.title_version}"
+    )
 
 
 def test_valid_config_file(tmp_path: Path):

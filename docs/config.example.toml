@@ -24,13 +24,17 @@ debug = false
 
 # if you don't specify the template for a resource
 # then default template will be used.
-default = "{album.artist}/{album.title}/{item.title}"
+default = "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - {item.title_version}"
 
-# track = "tracks/{item.id}"
-# video = "videos/{item.title}"
-# album = "artists/{album.artist}/{album.title}/{item.title}"
-# playlist = "{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
-# mix = "mixes/{mix_id}/{item.artist} - {item.title}"
+# Rekordbox-friendly rule:
+# - Artist, title, album and track number stay as metadata tags.
+# - The filename is only a stable fallback for browsing and relocation.
+# - Do not duplicate the artist inside the title metadata.
+# track = "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - {item.title_version}"
+# video = "video/{item.artist}/{item.title_version}"
+# album = "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - {item.title_version}"
+# playlist = "playlist/{playlist.title}/{playlist.index:03d} - {item.artist} - {item.title_version}"
+# mix = "mixes/{mix_id}/{item.artist} - {item.title_version}"
 
 
 [download]
@@ -51,13 +55,15 @@ skip_existing = true
 # how many items will be downloaded at once, recommended to keep it low
 threads_count = 4
 
-# base download directory, by default it is set to your home directory / Music / tiddl
+# base download directory, by default it is set to your home directory / Music / tiddl.
+# The desktop app can update this value from the Archivos tab.
 # download_path = ""
 
 # if you moved the downloaded files to other directory,
 # then you should specify the destination directory there.
 # otherwise `tiddl` will not detect them and `skip_existing` will not skip
 # already downloaded files. by default scan path is set to your download path.
+# The desktop app keeps this aligned with download_path when changing the root.
 # scan_path = ""
 
 # this option is used to determine if you want to include downloading singles from an artist.

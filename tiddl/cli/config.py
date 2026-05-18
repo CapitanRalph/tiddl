@@ -9,6 +9,14 @@ from tiddl.core.utils.const import TRACK_QUALITY_LITERAL, VIDEO_QUALITY_LITERAL
 
 CONFIG_FILENAME = "config.toml"
 DEFAULT_DOWNLOAD_PATH = Path.home() / "Music" / "tiddl"
+DEFAULT_REKORDBOX_TEMPLATE = (
+    "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - "
+    "{item.title_version}"
+)
+DEFAULT_REKORDBOX_PLAYLIST_TEMPLATE = (
+    "playlist/{playlist.title}/{playlist.index:03d} - {item.artist} - "
+    "{item.title_version}"
+)
 
 ARTIST_SINGLES_FILTER_LITERAL = Literal["none", "only", "include"]
 VALID_M3U_RESOURCE_LITERAL = Literal["album", "playlist", "mix"]
@@ -90,12 +98,12 @@ class Config(BaseModel):
     m3u: M3UConfig = M3UConfig()
 
     class TemplatesConfig(BaseModel):
-        default: str = "{album.artist}/{album.title}/{item.title}"
+        default: str = DEFAULT_REKORDBOX_TEMPLATE
         track: str = ""
-        video: str = ""
+        video: str = "video/{item.artist}/{item.title_version}"
         album: str = ""
-        playlist: str = ""
-        mix: str = ""
+        playlist: str = DEFAULT_REKORDBOX_PLAYLIST_TEMPLATE
+        mix: str = "mixes/{mix_id}/{item.artist} - {item.title_version}"
 
         def model_post_init(self, __context):
             assert self.default != "", "Default template cannot be empty."

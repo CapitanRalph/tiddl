@@ -1,4 +1,4 @@
-# Tidal Downloader
+# Tiddl DDJ
 
 Descarga tracks y videos desde Tidal en la mejor calidad disponible. `tiddl` es
 una aplicación CLI y desktop local escrita en Python.

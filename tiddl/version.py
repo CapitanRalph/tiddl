@@ -3,6 +3,8 @@ from pathlib import Path
 import tomllib
 
 PACKAGE_NAME = "tiddl"
+APP_NAME = "Tiddl DDJ"
+APP_AUTHOR = "Psybots"
 
 
 def _version_from_pyproject() -> str:
@@ -28,4 +30,4 @@ def _package_version() -> str:
 PACKAGE_VERSION = _package_version()
 APP_VERSION = f"v{PACKAGE_VERSION}"
 
-__all__ = ["APP_VERSION", "PACKAGE_VERSION"]
+__all__ = ["APP_AUTHOR", "APP_NAME", "APP_VERSION", "PACKAGE_VERSION"]

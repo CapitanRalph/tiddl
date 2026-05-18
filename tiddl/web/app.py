@@ -8,15 +8,23 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from tiddl.cli.config import CONFIG, TRACK_QUALITY_LITERAL, VIDEO_QUALITY_LITERAL
+from tiddl.cli.config import (
+    CONFIG,
+    CONFIG_FILENAME,
+    TRACK_QUALITY_LITERAL,
+    VIDEO_QUALITY_LITERAL,
+)
 from tiddl.cli.commands.download.downloader import DownloadCancelled, Downloader
 from tiddl.cli.const import APP_PATH
 from tiddl.cli.utils.auth import AuthData, load_auth_data, save_auth_data
@@ -29,11 +37,14 @@ from tiddl.core.utils.const import track_qualities, video_qualities
 from tiddl.core.utils.ffmpeg import convert_audio_to_mp3_320, convert_audio_to_wav
 from tiddl.core.utils.format import format_template
 from tiddl.core.utils.sanitize import sanitize_string
-from tiddl.version import APP_VERSION
+from tiddl.updater import UpdateInfo, check_for_update, download_and_open_update
+from tiddl.version import APP_AUTHOR, APP_NAME, APP_VERSION
 
 ResourceKind = Literal["track", "album", "playlist"]
 AudioOutputFormat = Literal["raw", "wav", "mp3_320"]
 WEB_FAVORITES_LIMIT = 50
+EXPLORER_MAX_ENTRIES = 160
+WEB_ASSETS_PATH = Path(__file__).resolve().parent / "assets"
 log = logging.getLogger("tiddl.web")
 
 
@@ -246,7 +257,8 @@ class MetadataPayload:
 
 def create_app(state: WebState | None = None) -> FastAPI:
     web_state = state or WebState()
-    app = FastAPI(title=f"Psybots Tiddl {APP_VERSION}")
+    app = FastAPI(title=f"{APP_NAME} {APP_VERSION}")
+    app.mount("/assets", StaticFiles(directory=WEB_ASSETS_PATH), name="assets")
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
@@ -314,6 +326,29 @@ def create_app(state: WebState | None = None) -> FastAPI:
 
         return render_login_attempt(attempt)
 
+    @app.get("/partials/update", response_class=HTMLResponse)
+    def update_status() -> str:
+        try:
+            return render_update_panel(check_for_update())
+        except Exception as exc:
+            log.warning("could not check update: %s", exc)
+            return render_update_error(f"No pudimos revisar actualizaciones: {exc}")
+
+    @app.post("/update/install", response_class=HTMLResponse)
+    def update_install() -> str:
+        try:
+            info, installer = download_and_open_update()
+        except Exception as exc:
+            log.exception("could not install update")
+            return render_update_error(f"No pudimos preparar la actualización: {exc}")
+
+        if installer:
+            return render_update_message(
+                f"Instalador abierto: {installer.name}. Cierra {APP_NAME} cuando termine."
+            )
+
+        return render_update_panel(info)
+
     @app.get("/partials/library", response_class=HTMLResponse)
     def library(kind: ResourceKind = "playlist") -> str:
         if not web_state.authenticated():
@@ -329,6 +364,22 @@ def create_app(state: WebState | None = None) -> FastAPI:
             return render_inline_error(
                 f"No pudimos cargar la biblioteca: {friendly_error(exc)}"
             )
+
+    @app.get("/partials/files", response_class=HTMLResponse)
+    def files(path: str = "") -> str:
+        return render_file_explorer(path)
+
+    @app.post("/settings/download-root", response_class=HTMLResponse)
+    def update_download_root(download_path: str = Form(...)) -> str:
+        try:
+            root = configure_download_root(download_path)
+        except Exception as exc:
+            log.exception("could not update download root")
+            return render_file_explorer(notice=f"No pudimos guardar la ruta: {exc}")
+
+        return render_file_explorer(
+            notice=f"Ruta de descargas actualizada: {root}",
+        )
 
     @app.get("/partials/preview", response_class=HTMLResponse)
     def preview(resource: str) -> str:
@@ -590,6 +641,153 @@ def open_folder(folder: Path) -> None:
         os.startfile(folder)  # type: ignore[attr-defined]
     else:
         subprocess.Popen(["xdg-open", str(folder)])
+
+
+def explorer_root() -> Path:
+    return CONFIG.download.download_path.expanduser().resolve()
+
+
+def toml_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def save_download_root_config(
+    download_path: Path,
+    config_file: Path = APP_PATH / CONFIG_FILENAME,
+) -> None:
+    download_value = f"download_path = {toml_string(str(download_path))}"
+    scan_value = f"scan_path = {toml_string(str(download_path))}"
+
+    if not config_file.exists():
+        config_file.write_text(f"[download]\n{download_value}\n{scan_value}\n")
+        return
+
+    lines = config_file.read_text().splitlines()
+    output: list[str] = []
+    in_download = False
+    found_download_section = False
+    wrote_download_path = False
+    wrote_scan_path = False
+
+    def append_missing_download_keys() -> None:
+        nonlocal wrote_download_path, wrote_scan_path
+        if not wrote_download_path:
+            output.append(download_value)
+            wrote_download_path = True
+        if not wrote_scan_path:
+            output.append(scan_value)
+            wrote_scan_path = True
+
+    for line in lines:
+        stripped = line.strip()
+        is_section = stripped.startswith("[") and stripped.endswith("]")
+
+        if is_section and in_download and stripped != "[download]":
+            append_missing_download_keys()
+            in_download = False
+
+        if stripped == "[download]":
+            found_download_section = True
+            in_download = True
+
+        if in_download and not stripped.startswith("#"):
+            if stripped.startswith("download_path"):
+                output.append(download_value)
+                wrote_download_path = True
+                continue
+
+            if stripped.startswith("scan_path"):
+                output.append(scan_value)
+                wrote_scan_path = True
+                continue
+
+        output.append(line)
+
+    if in_download:
+        append_missing_download_keys()
+
+    if not found_download_section:
+        output.extend(["", "[download]", download_value, scan_value])
+
+    config_file.write_text("\n".join(output).rstrip() + "\n")
+
+
+def configure_download_root(value: str) -> Path:
+    root = Path(value).expanduser()
+    if not root.is_absolute():
+        raise ValueError("Usa una ruta absoluta para las descargas.")
+
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    CONFIG.download.download_path = root
+    CONFIG.download.scan_path = root
+    save_download_root_config(root)
+    return root
+
+
+def resolve_explorer_path(relative_path: str = "") -> tuple[Path, str]:
+    root = explorer_root()
+    requested = Path(relative_path) if relative_path else Path()
+
+    if requested.is_absolute() or any(part == ".." for part in requested.parts):
+        requested = Path()
+
+    target = (root / requested).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        target = root
+
+    if not target.exists():
+        target = root
+
+    if target.is_file():
+        target = target.parent
+
+    relative = "" if target == root else target.relative_to(root).as_posix()
+    return target, relative
+
+
+def file_kind(path: Path) -> str:
+    if path.is_dir():
+        return "Carpeta"
+
+    suffix = path.suffix.lower()
+    if suffix in {".flac", ".m4a", ".mp3", ".wav", ".lrc"}:
+        return "Audio"
+    if suffix in {".mp4", ".mkv", ".webm", ".ts"}:
+        return "Video"
+    if suffix in {".m3u", ".m3u8"}:
+        return "Playlist"
+    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        return "Imagen"
+    return "Archivo"
+
+
+def file_count_label(path: Path) -> str:
+    if path.is_dir():
+        try:
+            children = list(path.iterdir())
+        except OSError:
+            return "Sin acceso"
+
+        dirs = sum(1 for child in children if child.is_dir())
+        files = sum(1 for child in children if child.is_file())
+        return f"{dirs} carpetas · {files} archivos"
+
+    try:
+        return format_bytes(path.stat().st_size)
+    except OSError:
+        return "Sin acceso"
+
+
+def modified_label(path: Path) -> str:
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return ""
+
+    return modified.strftime("%Y-%m-%d %H:%M")
 
 
 def run_download_job(
@@ -864,7 +1062,7 @@ def web_playlist_item_filename(
 ) -> Path:
     return Path(
         format_template(
-            "{playlist.index:03d} - {item.artist} - {item.title}",
+            "{playlist.index:03d} - {item.artist} - {item.title_version}",
             item=item,
             album=album,
             playlist=playlist,
@@ -1002,6 +1200,119 @@ def render_library(api: TidalAPI, kind: ResourceKind) -> str:
       <p class="muted list-count">{escape(library_count_label(kind, len(rows), total_count))}</p>
       {"".join(rows)}
     </div>
+    """
+
+
+def render_file_explorer(path: str = "", notice: str = "") -> str:
+    root = explorer_root()
+    current, relative = resolve_explorer_path(path)
+    root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        entries = sorted(
+            current.iterdir(),
+            key=lambda item: (not item.is_dir(), item.name.lower()),
+        )
+        access_error = ""
+    except OSError as exc:
+        entries = []
+        access_error = f"No pudimos leer esta carpeta: {exc}"
+
+    shown_entries = entries[:EXPLORER_MAX_ENTRIES]
+    parent_path = ""
+    if relative:
+        parent_path = Path(relative).parent.as_posix()
+        if parent_path == ".":
+            parent_path = ""
+
+    playlist_root = root / "playlist"
+    playlist_count = 0
+    if playlist_root.exists():
+        try:
+            playlist_count = sum(1 for item in playlist_root.iterdir() if item.is_dir())
+        except OSError:
+            playlist_count = 0
+
+    rows = "".join(render_file_entry(item, root) for item in shown_entries)
+    if not rows:
+        rows = '<p class="muted">Esta carpeta no tiene archivos descargados.</p>'
+
+    limit_notice = ""
+    if len(entries) > EXPLORER_MAX_ENTRIES:
+        limit_notice = (
+            f'<p class="muted list-count">Mostrando {EXPLORER_MAX_ENTRIES} '
+            f"de {len(entries)} elementos.</p>"
+        )
+
+    parent_button = ""
+    if relative:
+        parent_button = f"""
+        <button hx-get="/partials/files?path={quote(parent_path)}" hx-target="#library" hx-swap="innerHTML">Subir</button>
+        """
+
+    notice_html = render_inline_error(notice) if notice else ""
+    error_html = render_inline_error(access_error) if access_error else ""
+
+    return f"""
+    <div class="file-explorer">
+      <form class="path-settings" hx-post="/settings/download-root" hx-target="#library" hx-swap="innerHTML">
+        <label>
+          <span>Ruta de descargas</span>
+          <input name="download_path" value="{escape(str(root))}">
+        </label>
+        <button>Guardar</button>
+      </form>
+      {notice_html}
+      {error_html}
+      <div class="explorer-summary">
+        <div>
+          <strong>{escape(current.name or str(current))}</strong>
+          <p class="muted">{escape(file_count_label(current))} · {playlist_count} playlists detectadas</p>
+        </div>
+        <form hx-post="/open-folder" hx-target="#status-bar" hx-swap="outerHTML">
+          <input type="hidden" name="path" value="{escape(str(current))}">
+          <button>Abrir</button>
+        </form>
+      </div>
+      <div class="explorer-nav">
+        {parent_button}
+        <code>{escape(relative or ".")}</code>
+      </div>
+      {limit_notice}
+      <div class="file-list">{rows}</div>
+    </div>
+    """
+
+
+def render_file_entry(path: Path, root: Path) -> str:
+    name = path.name
+    kind = file_kind(path)
+    relative = path.relative_to(root).as_posix()
+    modified = modified_label(path)
+    meta = f"{kind} · {file_count_label(path)}"
+    if modified:
+        meta = f"{meta} · {modified}"
+
+    if path.is_dir():
+        action = f"""
+        <button hx-get="/partials/files?path={quote(relative)}" hx-target="#library" hx-swap="innerHTML">Ver</button>
+        """
+    else:
+        action = f"""
+        <form hx-post="/open-folder" hx-target="#status-bar" hx-swap="outerHTML">
+          <input type="hidden" name="path" value="{escape(str(path))}">
+          <button>Abrir ubicación</button>
+        </form>
+        """
+
+    return f"""
+    <article class="file-row">
+      <div>
+        <strong>{escape(name)}</strong>
+        <p class="muted">{escape(meta)}</p>
+      </div>
+      {action}
+    </article>
     """
 
 
@@ -1506,6 +1817,53 @@ def render_status_message(message: str) -> str:
     """
 
 
+def render_update_panel(info: UpdateInfo) -> str:
+    if not info.available:
+        return f"""
+        <section id="update-panel" class="update-panel">
+          <span>{escape(APP_VERSION)}</span>
+          <small>Actualizado</small>
+        </section>
+        """
+
+    if not info.asset:
+        return f"""
+        <section id="update-panel" class="update-panel warning">
+          <span>{escape(info.latest_version)} disponible</span>
+          <a href="{escape(info.release_url)}" target="_blank" rel="noreferrer">Ver release</a>
+        </section>
+        """
+
+    return f"""
+    <section id="update-panel" class="update-panel available">
+      <div>
+        <span>{escape(info.latest_version)} disponible</span>
+        <small>{escape(info.asset.name)}</small>
+      </div>
+      <form hx-post="/update/install" hx-target="#update-panel" hx-swap="outerHTML">
+        <button class="update-button">Actualizar</button>
+      </form>
+    </section>
+    """
+
+
+def render_update_message(message: str) -> str:
+    return f"""
+    <section id="update-panel" class="update-panel available">
+      <span>{escape(message)}</span>
+    </section>
+    """
+
+
+def render_update_error(message: str) -> str:
+    return f"""
+    <section id="update-panel" class="update-panel warning">
+      <span>{escape(APP_VERSION)}</span>
+      <small>{escape(message)}</small>
+    </section>
+    """
+
+
 def page() -> str:
     html = """
     <!doctype html>
@@ -1513,7 +1871,7 @@ def page() -> str:
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Psybots Tiddl __APP_VERSION__</title>
+      <title>__APP_NAME__ __APP_VERSION__</title>
       <script>
         (() => {
           const escapeHtml = (value) => String(value)
@@ -1629,18 +1987,32 @@ def page() -> str:
         html { height: 100%; background: #101820; }
         body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f2f6f8; color: var(--ink); overflow: hidden; }
         header { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 22px; border-bottom: 1px solid #243642; background: #101820; color: #f6fafb; }
+        .brand-block { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+        .brand-logo { width: 34px; height: 34px; object-fit: contain; border-radius: 8px; background: #f6fafb; padding: 3px; align-self: center; }
+        .header-meta { display: flex; align-items: center; justify-content: flex-end; gap: 14px; min-width: 0; }
         .app-subtitle { text-align: right; color: #b7c5cd; }
+        .update-panel { min-height: 32px; display: flex; align-items: center; gap: 10px; justify-content: flex-end; color: #dce8ec; font-size: 12px; }
+        .update-panel span { font-weight: 700; }
+        .update-panel small { display: block; color: #9fb1bb; font-size: 11px; line-height: 1.2; }
+        .update-panel a { color: #8ce0d1; font-weight: 700; text-decoration: none; }
+        .update-panel form { margin: 0; }
+        .update-panel.warning span { color: #ffdca2; }
+        .update-button { min-height: 30px; border-color: #375260; color: #8ce0d1; background: #17242d; }
+        .update-button:hover { border-color: #578092; background: #1d303b; }
         .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 8px 24px rgba(24, 35, 45, .04); z-index: 1; }
         main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; overflow: hidden; }
         aside { border-right: 1px solid var(--line); padding: 14px 12px; background: var(--panel); overflow: auto; }
         .workspace { display: grid; grid-template-rows: minmax(0, 1fr) minmax(210px, 34vh); min-height: 0; height: 100%; overflow: hidden; }
-        section.preview-pane, section.queue-pane { min-height: 0; padding: 18px; overflow: auto; }
+        section.preview-pane, section.queue-pane { min-height: 0; padding: 16px 18px; overflow: auto; font-size: 13px; }
         section.preview-pane { border-bottom: 1px solid var(--line); }
         h1 { font-size: 18px; line-height: 1.2; margin: 0; white-space: nowrap; }
         .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid #375260; border-radius: 999px; font-size: 12px; color: #8ce0d1; background: #17242d; vertical-align: middle; }
         h2 { font-size: 16px; line-height: 1.25; margin: 0 0 6px; }
         h3 { font-size: 13px; line-height: 1.3; margin: 0 0 8px; }
         .muted { color: var(--muted); margin: 0; font-size: 13px; line-height: 1.45; }
+        .preview-pane h2, .queue-pane h2 { font-size: 15px; margin-bottom: 5px; }
+        .preview-pane h3, .queue-pane h3 { font-size: 12px; margin-bottom: 6px; }
+        .preview-pane .muted, .queue-pane .muted { font-size: 12px; line-height: 1.35; }
         .panel { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; margin-bottom: 12px; box-shadow: var(--shadow); }
         .actions, .tabs, form.inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         button, input, select { min-height: 38px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); padding: 0 11px; font: inherit; font-size: 14px; }
@@ -1657,19 +2029,30 @@ def page() -> str:
         .tabs { margin: 8px 0 4px; }
         .tabs button { min-width: 86px; background: #f9fbfd; }
         .link { color: var(--accent); font-size: 13px; font-weight: 600; }
-        .library-list { display: grid; gap: 2px; margin-top: 8px; }
+        .library-list, .file-list { display: grid; gap: 2px; margin-top: 8px; }
         .list-count { padding: 4px 2px 6px; }
-        .resource-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 10px 0; }
+        .resource-row, .file-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 10px 0; }
         .resource-row { width: 100%; min-height: 52px; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 10px 4px; }
         .resource-main { min-width: 0; }
         .resource-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .resource-row > span { flex: 0 0 auto; color: var(--accent); font-size: 12px; font-weight: 700; }
         .resource-row:hover { background: #e8f4f1; padding-left: 10px; padding-right: 10px; border-radius: 7px; }
+        .file-explorer { display: grid; gap: 10px; }
+        .path-settings { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+        .path-settings label { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--muted); }
+        .explorer-summary { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+        .explorer-summary > div { min-width: 0; }
+        .explorer-nav { display: flex; gap: 8px; align-items: center; min-width: 0; }
+        .explorer-nav code { flex: 1; min-width: 0; }
+        .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+        .file-row strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+        .file-row form { margin: 0; }
         .preview-card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
-        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 16px; border-bottom: 1px solid var(--soft-line); }
+        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--soft-line); }
         .preview-head > div { min-width: 0; }
-        .track-list { padding: 0 14px 6px; }
-        .track-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center; }
+        .track-list { padding: 0 12px 4px; }
+        .track-row { display: grid; grid-template-columns: 30px 1fr auto; gap: 10px; align-items: center; padding: 8px 0; }
+        .track-row strong, .job-top strong { font-size: 13px; line-height: 1.3; }
         .download-form, .compact-form { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
         .download-form label, .compact-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
         .compact-form select { width: 96px; }
@@ -1679,41 +2062,43 @@ def page() -> str:
         .manual-download h2 { margin-bottom: 0; }
         .manual-download .settings { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(190px, 240px) minmax(140px, 190px) minmax(120px, 150px) auto; gap: 10px; align-items: end; }
         .manual-download label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-        .job-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); box-shadow: var(--shadow); }
+        .job-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--surface); box-shadow: var(--shadow); }
+        .job { padding: 8px 0; }
         .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
         .job-top > div { min-width: 0; }
         .job-top strong { overflow-wrap: anywhere; }
         .job-actions { display: grid; gap: 6px; justify-items: end; }
         .cancel-form { margin: 0; }
         .notice-job { border-bottom: 0; padding-bottom: 0; }
-        .badge { flex: 0 0 auto; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; background: var(--surface-soft); }
+        .badge { flex: 0 0 auto; font-size: 10px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; background: var(--surface-soft); }
         .badge.done { color: var(--accent); border-color: var(--accent); }
         .badge.failed { color: var(--danger); border-color: var(--danger); }
         .badge.running { color: var(--warn); border-color: var(--warn); }
         .badge.canceling, .badge.canceled { color: #607184; border-color: #aebac5; }
         .meter { height: 6px; background: #e8ecef; border-radius: 999px; overflow: hidden; margin: 8px 0; }
         .meter span { display: block; height: 100%; background: var(--accent); }
-        .job-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+        .job-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 8px 0; }
         .job-facts div { min-width: 0; }
-        .job-facts dt { color: var(--muted); font-size: 11px; margin: 0 0 2px; }
-        .job-facts dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+        .job-facts dt { color: var(--muted); font-size: 10px; margin: 0 0 2px; }
+        .job-facts dd { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
         .job-path { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
-        .job-path span { color: var(--muted); font-size: 12px; }
+        .job-path span { color: var(--muted); font-size: 11px; }
         .job-path form, .result-row form { margin: 0; }
         .result-list { display: grid; gap: 8px; margin-top: 10px; }
         .result-row { display: grid; grid-template-columns: minmax(82px, auto) minmax(0, 1fr) auto; gap: 4px 8px; align-items: center; padding-bottom: 8px; border-bottom: 1px solid #eef1f3; }
         .result-row code { grid-column: 1 / -1; }
-        .result-status { color: var(--muted); font-size: 12px; }
-        code { font-size: 12px; word-break: break-all; }
+        .result-status { color: var(--muted); font-size: 11px; }
+        code { font-size: 11px; word-break: break-all; }
         .error { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
         .status-bar { height: 96px; display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 16px; padding: 12px 20px; border-top: 1px solid var(--line); background: #101820; color: #f4f7f8; }
         .status-bar strong { display: block; font-size: 12px; color: #9fd7cc; margin-bottom: 4px; }
         .status-bar p { margin: 0; font-size: 13px; line-height: 1.45; color: #e1e7ea; overflow-wrap: anywhere; }
         @media (max-width: 920px) {
           body { display: block; height: auto; overflow: auto; }
-          header { align-items: flex-start; flex-direction: column; gap: 4px; padding: 10px 20px; }
+          header { align-items: flex-start; flex-direction: column; gap: 6px; padding: 10px 20px; }
           h1 { white-space: normal; }
+          .header-meta { align-items: flex-start; flex-direction: column; gap: 6px; }
           .app-subtitle { text-align: left; }
           main { grid-template-columns: 1fr; height: auto; }
           section.workspace { grid-template-rows: auto auto; }
@@ -1726,14 +2111,26 @@ def page() -> str:
           .job-board, .status-bar { grid-template-columns: 1fr; }
           .status-bar { height: auto; }
           .manual-download .settings { grid-template-columns: 1fr; }
-          .job-path, .result-row { grid-template-columns: 1fr; }
+          .job-path, .result-row, .file-row, .path-settings { grid-template-columns: 1fr; }
         }
       </style>
     </head>
     <body>
       <header>
-        <h1>Psybots Tiddl <span class="version-badge">__APP_VERSION__</span></h1>
-        <span class="muted app-subtitle">Autor: Psybots · Aplicación de escritorio local · __APP_VERSION__</span>
+        <div class="brand-block">
+          <img class="brand-logo" src="/assets/tiddl-ddj-logo.png" alt="" aria-hidden="true">
+          <h1>__APP_NAME__</h1>
+          <span class="version-badge">__APP_VERSION__</span>
+        </div>
+        <div class="header-meta">
+          <span class="muted app-subtitle">Autor: __APP_AUTHOR__ · App local</span>
+          <div hx-get="/partials/update" hx-trigger="load" hx-swap="outerHTML">
+            <section id="update-panel" class="update-panel">
+              <span>__APP_VERSION__</span>
+              <small>Revisando actualización...</small>
+            </section>
+          </div>
+        </div>
       </header>
       <section class="direct-bar">
         <form class="manual-download" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
@@ -1776,6 +2173,7 @@ def page() -> str:
               <button hx-get="/partials/library?kind=playlist" hx-target="#library">Playlists</button>
               <button hx-get="/partials/library?kind=album" hx-target="#library">Álbumes</button>
               <button hx-get="/partials/library?kind=track" hx-target="#library">Canciones</button>
+              <button hx-get="/partials/files" hx-target="#library">Archivos</button>
             </div>
             <div id="library" hx-get="/partials/library?kind=playlist" hx-trigger="load">
               <p class="muted">Cargando biblioteca...</p>
@@ -1820,6 +2218,8 @@ def page() -> str:
     """
     return (
         html.replace("__APP_VERSION__", APP_VERSION)
+        .replace("__APP_NAME__", APP_NAME)
+        .replace("__APP_AUTHOR__", APP_AUTHOR)
         .replace(
             "__TRACK_QUALITY_OPTIONS__", quality_options(CONFIG.download.track_quality)
         )
@@ -1902,7 +2302,7 @@ def run_desktop(
         import webview
 
         webview.create_window(
-            "Psybots Tiddl",
+            APP_NAME,
             f"http://{host}:{port}",
             width=1240,
             height=820,

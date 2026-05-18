@@ -1,5 +1,40 @@
 # Notas de actualización
 
+## v1.1.12
+
+- Se integró el logo de Tiddl DDJ en el encabezado de la app desktop.
+- Se cambió la plantilla de nombres por defecto a un formato compatible con
+  rekordbox: carpetas por artista/álbum y archivos con número, artista y título.
+- Las playlists descargadas usan índice de playlist, artista y título con versión
+  para mantener orden estable en crates/sets.
+- La metadata de artistas conserva el orden original entregado por TIDAL en vez
+  de ordenarse alfabéticamente.
+
+## v1.1.11
+
+- Se agregó una pestaña Archivos para explorar la carpeta absoluta de descargas
+  de la app desde la interfaz desktop.
+- La ruta raíz de descargas ahora se puede cambiar desde el explorador y queda
+  persistida en `config.toml` como `download_path` y `scan_path`.
+- El explorador detecta carpetas, archivos y playlists descargadas bajo la raíz
+  configurada, con acciones para abrir carpetas desde el sistema.
+
+## v1.1.10
+
+- La aplicación visible ahora se llama Tiddl DDJ; Psybots queda sólo como autor
+  en el front.
+- Se agregó una primera integración de actualizaciones vía GitHub Releases:
+  revisión desde la UI, detección de plataforma, selección de instalador,
+  descarga, verificación SHA256 cuando GitHub entrega digest y apertura del
+  instalador del sistema.
+
+## v1.1.9
+
+- Se redujo el tamaño visual de textos en vista previa y cola de descargas para
+  que la app desktop se sienta más compacta y operativa.
+- Se ajustaron badges, datos de descarga, rutas y filas de canciones sin cambiar
+  el tamaño de los controles principales.
+
 ## v1.1.8
 
 - Se modernizó la interfaz desktop con superficies más claras, header renovado,

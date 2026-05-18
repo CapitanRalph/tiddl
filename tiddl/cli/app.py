@@ -7,7 +7,7 @@ from tiddl.cli.config import APP_PATH, CONFIG
 from tiddl.cli.ctx import ContextObject, Context
 from tiddl.cli.commands import register_commands
 from tiddl.core.utils.ffmpeg import is_ffmpeg_installed as ifs
-from tiddl.version import APP_VERSION
+from tiddl.version import APP_NAME, APP_VERSION
 
 log = logging.getLogger("tiddl")
 
@@ -47,7 +47,7 @@ def callback(
     ] = None,
 ):
     f"""
-    tiddl {APP_VERSION} - download tidal tracks \u266b
+    {APP_NAME} {APP_VERSION} - download tidal tracks \u266b
 
     [link=https://github.com/CapitanRalph/tiddl]github (https://github.com/CapitanRalph/tiddl)[/link]
     """

@@ -189,7 +189,7 @@ def add_track_metadata(
         disc_number=str(track.volumeNumber),
         copyright=track.copyright,
         album_artist=album_artist,
-        artists=sorted(a.name.strip() for a in track.artists),
+        artists=[a.name.strip() for a in track.artists if a.name.strip()],
         album_title=track.album.title,
         date=date,
         isrc=track.isrc,
