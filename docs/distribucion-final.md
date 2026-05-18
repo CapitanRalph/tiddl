@@ -491,10 +491,29 @@ Write-Host "https://github.com/CapitanRalph/tiddl/releases/latest"
 
 ### Workflow objetivo
 
-Crear `.github/workflows/release.yml` que se active al publicar tags:
+El repo incluye `.github/workflows/release-installers.yml`, que se activa al
+publicar tags `v*` o manualmente desde GitHub Actions.
+
+El workflow construye:
+
+- `Tiddl-DDJ-vX.Y.Z-macOS-arm64.dmg` en runner `macos-14`, pensado para
+  MacBook M1/M2 y Apple Silicon.
+- `Tiddl-DDJ-vX.Y.Z-Windows-x64-Setup.exe` en `windows-latest`.
+- `checksums.txt` con SHA256 de los instaladores.
+
+Para publicar una version:
+
+```bash
+git tag v1.1.16
+git push origin v1.1.16
+```
+
+El release se crea o actualiza automaticamente con esos assets.
+
+Resumen conceptual:
 
 ```yaml
-name: Release
+name: Release installers
 
 on:
   push:
@@ -507,7 +526,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-groups
+      - run: uv sync --dev
       - run: uv run pytest
       - run: uv run pyinstaller packaging/pyinstaller/tiddl-desktop.spec
       - run: powershell packaging/windows/build-installer.ps1
@@ -521,7 +540,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-groups
+      - run: uv sync --dev
       - run: uv run pytest
       - run: uv run pyinstaller packaging/pyinstaller/tiddl-desktop.spec
       - run: sh packaging/macos/build-dmg.sh

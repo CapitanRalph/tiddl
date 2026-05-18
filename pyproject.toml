@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiddl"
-version = "1.1.13"
+version = "1.1.16"
 description = "Download Tidal tracks with CLI downloader."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -41,6 +41,9 @@ tiddl-desktop = "tiddl.cli.commands.desktop:main"
 [tool.setuptools.package-data]
 "tiddl.web" = ["assets/*.png"]
 
+[tool.setuptools.packages.find]
+include = ["tiddl*"]
+
 [tool.coverage.run]
 omit = ["*/models/*", "*/models.py"]
 
@@ -48,6 +51,7 @@ omit = ["*/models/*", "*/models.py"]
 dev = [
     "httpx>=0.28.1",
     "mypy>=1.18.2",
+    "pyinstaller>=6.17.0",
     "pytest>=8.4.2",
     "pytest-mock>=3.15.1",
     "ruff>=0.14.0",

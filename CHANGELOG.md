@@ -1,5 +1,24 @@
 # Notas de actualización
 
+## v1.1.16
+
+- Los instaladores ahora generan iconos desde el logo oficial y los aplican al
+  bundle macOS y al instalador Windows.
+
+## v1.1.15
+
+- Se optimizó la spec de PyInstaller para empaquetar solo los módulos Qt
+  necesarios para la ventana desktop, reduciendo peso y ruido del build.
+
+## v1.1.14
+
+- Se agregó empaquetado de instaladores para GitHub Actions:
+  `.dmg` macOS arm64 para MacBook M1/M2 y `Setup.exe` Windows x64.
+- Se creó una spec de PyInstaller para construir la app desktop como bundle.
+- Se agregó script macOS para generar DMG y script Windows con Inno Setup.
+- El workflow de release publica los instaladores y `checksums.txt` cuando se
+  empuja un tag `v*`.
+
 ## v1.1.13
 
 - Las descargas de playlist ahora muestran el nombre real de la playlist en la
