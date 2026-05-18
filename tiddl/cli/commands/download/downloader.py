@@ -4,6 +4,7 @@ import shutil
 from logging import getLogger
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Callable
 
 import aiofiles
 import aiohttp
@@ -40,6 +41,10 @@ video_qualities_color: dict[StreamVideoQuality, str] = {
     "MEDIUM": "[cyan]720p",
     "HIGH": "[yellow]1080p",
 }
+
+
+class DownloadCancelled(Exception):
+    pass
 
 
 def get_track_quality_fallbacks(
@@ -89,6 +94,7 @@ class Downloader:
     scan_path: Path
     match_existing_path_case: bool
     dolby_atmos_filter: ATMOS_FILTER_LITERAL
+    cancel_requested: Callable[[], bool]
 
     def __init__(
         self,
@@ -103,6 +109,7 @@ class Downloader:
         scan_path: Path,
         match_existing_path_case: bool = False,
         dolby_atmos_filter: ATMOS_FILTER_LITERAL = "none",
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.api = tidal_api
         self.rich_output = rich_output
@@ -115,6 +122,11 @@ class Downloader:
         self.scan_path = scan_path
         self.match_existing_path_case = match_existing_path_case
         self.dolby_atmos_filter = dolby_atmos_filter
+        self.cancel_requested = cancel_requested or (lambda: False)
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancel_requested():
+            raise DownloadCancelled("Descarga cancelada")
 
     def get_path(self, base_path: Path, relative_path: Path) -> Path:
         if self.match_existing_path_case:
@@ -130,6 +142,7 @@ class Downloader:
         - Path `item_path` path of existing/downloaded item
         - bool `was_downloaded`
         """
+        self.raise_if_cancelled()
 
         if not item.allowStreaming:
             self.rich_output.console.print(
@@ -177,7 +190,11 @@ class Downloader:
 
         should_extract_flac = False
 
+        self.raise_if_cancelled()
+
         async with self.semaphore:
+            self.raise_if_cancelled()
+
             if isinstance(item, Track):
                 stream = None
                 stream_error: ApiError | None = None
@@ -265,6 +282,7 @@ class Downloader:
                 async with aiohttp.ClientSession(trust_env=True) as session:
                     async with aiofiles.open(tmp_name, "wb") as f:
                         for url in urls:
+                            self.raise_if_cancelled()
                             async with session.get(url) as resp:
                                 if resp.status >= 400:
                                     body = await resp.text()
@@ -281,6 +299,7 @@ class Downloader:
                                 async for chunk in resp.content.iter_chunked(
                                     CHUNK_SIZE
                                 ):
+                                    self.raise_if_cancelled()
                                     await f.write(chunk)
                                     self.rich_output.download_advance(
                                         task_id, size=len(chunk)
@@ -319,6 +338,23 @@ class Downloader:
                     item_path=download_path,
                 )
 
+            except DownloadCancelled:
+                if tmp_name and os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        log.warning("could not remove temp download %s", tmp_name)
+                try:
+                    self.rich_output.download_finish(task_id=task_id)
+                except Exception:
+                    pass
+                log.info(
+                    "download canceled item_id=%s title=%s target=%s",
+                    item.id,
+                    item.title,
+                    download_path,
+                )
+                raise
             except Exception:
                 if tmp_name and os.path.exists(tmp_name):
                     try:

@@ -9,7 +9,7 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, Form, HTTPException
@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 
 from tiddl.cli.config import CONFIG, TRACK_QUALITY_LITERAL, VIDEO_QUALITY_LITERAL
-from tiddl.cli.commands.download.downloader import Downloader
+from tiddl.cli.commands.download.downloader import DownloadCancelled, Downloader
 from tiddl.cli.const import APP_PATH
 from tiddl.cli.utils.auth import AuthData, load_auth_data, save_auth_data
 from tiddl.cli.utils.resource import TidalResource
@@ -71,6 +71,8 @@ class DownloadJob:
     active_items: dict[int, str] = field(default_factory=dict)
     terminal: list[str] = field(default_factory=list)
     error: str = ""
+    cancel_requested: bool = False
+    canceled_at: float | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -406,6 +408,21 @@ def create_app(state: WebState | None = None) -> FastAPI:
         thread.start()
         return render_jobs(web_state)
 
+    @app.post("/jobs/{job_id}/cancel", response_class=HTMLResponse)
+    def cancel_job(job_id: str) -> str:
+        with web_state.lock:
+            job = web_state.jobs.get(job_id)
+
+            if not job:
+                return render_jobs(
+                    web_state,
+                    notice="No encontramos esa descarga en la cola.",
+                )
+
+            request_job_cancel(job)
+
+        return render_jobs(web_state)
+
     @app.post("/open-folder", response_class=HTMLResponse)
     def open_download_folder(path: str = Form("")) -> str:
         try:
@@ -507,6 +524,39 @@ def friendly_error(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def request_job_cancel(job: DownloadJob) -> bool:
+    if job.cancel_requested or job.status in ("done", "failed", "canceled"):
+        return False
+
+    job.cancel_requested = True
+    job.canceled_at = time.time()
+    job.status = "canceling"
+    job.message = "Cancelando descarga"
+    job.terminal.append("Cancelación solicitada por el usuario")
+    job.terminal = job.terminal[-40:]
+    return True
+
+
+def finalize_canceled_job(job: DownloadJob) -> None:
+    job.cancel_requested = True
+    job.status = "canceled"
+    job.message = "Cancelada por el usuario"
+    job.error = ""
+    job.active_items.clear()
+    if not job.terminal or job.terminal[-1] != job.message:
+        job.terminal.append(job.message)
+        job.terminal = job.terminal[-40:]
+
+
+def raise_if_job_canceled(job: DownloadJob) -> None:
+    if job.cancel_requested:
+        raise DownloadCancelled("Descarga cancelada por el usuario")
+
+
+def can_cancel_job(job: DownloadJob) -> bool:
+    return job.status in ("queued", "running", "canceling") and not job.cancel_requested
+
+
 def clamp_concurrency(value: int) -> int:
     return max(1, min(3, value))
 
@@ -552,6 +602,7 @@ def run_download_job(
     video_quality: VIDEO_QUALITY_LITERAL,
 ) -> None:
     try:
+        raise_if_job_canceled(job)
         job.status = "running"
         job.message = "Preparando descarga"
         job.target_path = str(CONFIG.download.download_path)
@@ -580,17 +631,27 @@ def run_download_job(
                 video_quality,
             )
         )
-        if job.status != "failed":
+        if job.cancel_requested:
+            finalize_canceled_job(job)
+            log.info("job=%s canceled", job.id)
+        elif job.status != "failed":
             finalize_job(job)
             log.info(
                 "job=%s finished status=%s message=%s", job.id, job.status, job.message
             )
+    except DownloadCancelled:
+        finalize_canceled_job(job)
+        log.info("job=%s canceled", job.id)
     except Exception as exc:
-        job.status = "failed"
-        job.error = str(exc)
-        job.message = str(exc)
-        job.terminal.append(f"Error: {exc}")
-        log.exception("job=%s failed", job.id)
+        if job.cancel_requested:
+            finalize_canceled_job(job)
+            log.info("job=%s canceled after error=%s", job.id, exc)
+        else:
+            job.status = "failed"
+            job.error = str(exc)
+            job.message = str(exc)
+            job.terminal.append(f"Error: {exc}")
+            log.exception("job=%s failed", job.id)
 
 
 async def download_resource(
@@ -618,6 +679,7 @@ async def download_resource(
         scan_path=CONFIG.download.scan_path,
         match_existing_path_case=CONFIG.download.match_existing_path_case,
         dolby_atmos_filter=CONFIG.download.atmos_filter,
+        cancel_requested=lambda: job.cancel_requested,
     )
 
     async def handle_item(
@@ -625,12 +687,17 @@ async def download_resource(
         file_path: str,
         metadata: MetadataPayload | None = None,
     ) -> tuple[Path | None, Track | Video]:
+        raise_if_job_canceled(job)
         output.total_increment()
         metadata = metadata or MetadataPayload()
         completed_before = job.completed
 
         try:
             path, was_downloaded = await downloader.download(item, Path(file_path))
+        except DownloadCancelled:
+            if job.completed == completed_before:
+                output.mark_item_processed()
+            return None, item
         except Exception as exc:
             if job.completed == completed_before:
                 output.mark_item_processed()
@@ -691,6 +758,7 @@ async def download_resource(
 
     match resource.type:
         case "track":
+            raise_if_job_canceled(job)
             track = api.get_track(resource.id)
             album = api.get_album(track.album.id)
             await handle_item(
@@ -711,10 +779,19 @@ async def download_resource(
             )
 
         case "album":
+            raise_if_job_canceled(job)
             album = api.get_album(resource.id)
-            await download_album(api, album, handle_item, track_quality, video_quality)
+            await download_album(
+                api,
+                album,
+                handle_item,
+                track_quality,
+                video_quality,
+                cancel_requested=lambda: job.cancel_requested,
+            )
 
         case "playlist":
+            raise_if_job_canceled(job)
             playlist = api.get_playlist(resource.id)
             playlist_folder = web_playlist_folder(playlist)
             job.target_path = str(CONFIG.download.download_path / playlist_folder)
@@ -731,6 +808,7 @@ async def download_resource(
             futures = []
 
             while True:
+                raise_if_job_canceled(job)
                 items = api.get_playlist_items(resource.id, offset=offset)
                 for playlist_item in items.items:
                     playlist_index += 1
@@ -812,12 +890,17 @@ async def download_album(
     handle_item: Any,
     track_quality: TRACK_QUALITY_LITERAL,
     video_quality: VIDEO_QUALITY_LITERAL,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
     offset = 0
     futures = []
     cover = Cover(album.cover, size=CONFIG.cover.size) if album.cover else None
+    is_canceled = cancel_requested or (lambda: False)
 
     while True:
+        if is_canceled():
+            raise DownloadCancelled("Descarga cancelada por el usuario")
+
         album_items = api.get_album_items_credits(album.id, offset=offset)
         for album_item in album_items.items:
             item = album_item.item
@@ -1070,19 +1153,22 @@ def render_jobs(state: WebState, notice: str = "") -> str:
         )
         return """
         <section id="jobs" class="job-board">
-          <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
+          <div class="job-column"><h3>En curso</h3><p class="muted">Sin descargas activas.</p></div>
           <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
+          <div class="job-column"><h3>Canceladas</h3><p class="muted">Sin cancelaciones.</p></div>
           <div class="job-column"><h3>Errores</h3>__NOTICE__</div>
         </section>
         """.replace("__NOTICE__", notice_html)
 
-    queued = [job for job in jobs if job.status in ("queued", "running")]
+    queued = [job for job in jobs if job.status in ("queued", "running", "canceling")]
     done = [job for job in jobs if job.status == "done" and not has_job_errors(job)]
+    canceled = [job for job in jobs if job.status == "canceled"]
     failed = [job for job in jobs if job.status == "failed" or has_job_errors(job)]
     return f"""
     <section id="jobs" class="job-board">
-      {render_job_column("En cola", queued)}
+      {render_job_column("En curso", queued)}
       {render_job_column("Completadas", done)}
+      {render_job_column("Canceladas", canceled)}
       {render_job_column("Errores", failed, render_job_notice(notice) if notice else "")}
     </section>
     """
@@ -1167,7 +1253,10 @@ def render_job(job: DownloadJob) -> str:
           <strong>{escape(job.resource)}</strong>
           <p class="muted">{escape(job.message)}</p>
         </div>
-        <span class="badge {escape(job.status)}">{escape(job_status_label(job.status))}</span>
+        <div class="job-actions">
+          <span class="badge {escape(job.status)}">{escape(job_status_label(job.status))}</span>
+          {cancel_job_form(job)}
+        </div>
       </div>
       <div class="meter"><span style="width: {percent}%"></span></div>
       <dl class="job-facts">
@@ -1209,6 +1298,17 @@ def render_job_result(result: JobResult) -> str:
       <code>{escape(result.path or "Sin archivo")}</code>
       {open_button}
     </div>
+    """
+
+
+def cancel_job_form(job: DownloadJob) -> str:
+    if not can_cancel_job(job):
+        return ""
+
+    return f"""
+    <form class="cancel-form" hx-post="/jobs/{escape(job.id)}/cancel" hx-target="#jobs" hx-swap="outerHTML">
+      <button class="ghost danger" title="Cancelar esta descarga">Cancelar</button>
+    </form>
     """
 
 
@@ -1297,6 +1397,8 @@ def job_status_label(status: str) -> str:
     labels = {
         "queued": "En cola",
         "running": "En curso",
+        "canceling": "Cancelando",
+        "canceled": "Cancelada",
         "done": "Completada",
         "failed": "Error",
     }
@@ -1354,9 +1456,11 @@ def render_status(state: WebState) -> str:
     jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
     running = [job for job in jobs if job.status == "running"]
     queued = [job for job in jobs if job.status == "queued"]
+    canceling = [job for job in jobs if job.status == "canceling"]
     done = [job for job in jobs if job.status == "done"]
+    canceled = [job for job in jobs if job.status == "canceled"]
     failed = [job for job in jobs if job.status == "failed"]
-    active = running[0] if running else None
+    active = (running or canceling)[0] if running or canceling else None
     active_downloads = ", ".join(active.active_items.values()) if active else "Ninguna"
     latest_terminal = "Sin actividad"
 
@@ -1377,7 +1481,7 @@ def render_status(state: WebState) -> str:
       </div>
       <div>
         <strong>Progreso</strong>
-        <p>{len(running)} activas · {len(queued)} en cola · {len(done)} completas · {len(failed)} errores · log {escape(str(APP_PATH / "latest.log"))}</p>
+        <p>{len(running)} activas · {len(queued)} en cola · {len(canceling)} cancelando · {len(done)} completas · {len(canceled)} canceladas · {len(failed)} errores · log {escape(str(APP_PATH / "latest.log"))}</p>
       </div>
     </section>
     """
@@ -1520,26 +1624,26 @@ def page() -> str:
         })();
       </script>
       <style>
-        :root { color-scheme: light; --ink: #182128; --muted: #64717b; --line: #d8dee4; --panel: #f5f7f9; --accent: #0b806c; --accent-hover: #086c5c; --danger: #b43a3a; --warn: #966813; --focus: #82cfc1; }
+        :root { color-scheme: light; --ink: #162029; --muted: #61707f; --line: #d7e0e7; --soft-line: #edf2f6; --panel: #eef3f7; --surface: #ffffff; --surface-soft: #f8fafc; --accent: #0b806c; --accent-hover: #066c5c; --danger: #b33a3a; --danger-bg: #fff1f1; --warn: #98690d; --focus: #85d6ca; --shadow: 0 14px 34px rgba(18, 35, 49, .08); }
         * { box-sizing: border-box; }
         html { height: 100%; background: #101820; }
-        body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; min-height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #fff; color: var(--ink); overflow: hidden; }
-        header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 20px; border-bottom: 1px solid var(--line); background: #fbfbfc; }
-        .app-subtitle { text-align: right; }
-        .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: #fff; }
-        main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; }
-        aside { border-right: 1px solid var(--line); padding: 12px; background: var(--panel); overflow: auto; }
-        section.workspace { display: grid; grid-template-rows: minmax(280px, 1fr) minmax(210px, 34vh); min-height: 0; }
-        section.preview-pane, section.queue-pane { padding: 16px; overflow: auto; }
+        body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f2f6f8; color: var(--ink); overflow: hidden; }
+        header { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 22px; border-bottom: 1px solid #243642; background: #101820; color: #f6fafb; }
+        .app-subtitle { text-align: right; color: #b7c5cd; }
+        .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 8px 24px rgba(24, 35, 45, .04); z-index: 1; }
+        main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; overflow: hidden; }
+        aside { border-right: 1px solid var(--line); padding: 14px 12px; background: var(--panel); overflow: auto; }
+        .workspace { display: grid; grid-template-rows: minmax(0, 1fr) minmax(210px, 34vh); min-height: 0; height: 100%; overflow: hidden; }
+        section.preview-pane, section.queue-pane { min-height: 0; padding: 18px; overflow: auto; }
         section.preview-pane { border-bottom: 1px solid var(--line); }
         h1 { font-size: 18px; line-height: 1.2; margin: 0; white-space: nowrap; }
-        .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--accent); background: #fff; vertical-align: middle; }
+        .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid #375260; border-radius: 999px; font-size: 12px; color: #8ce0d1; background: #17242d; vertical-align: middle; }
         h2 { font-size: 16px; line-height: 1.25; margin: 0 0 6px; }
         h3 { font-size: 13px; line-height: 1.3; margin: 0 0 8px; }
         .muted { color: var(--muted); margin: 0; font-size: 13px; line-height: 1.45; }
-        .panel { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; border: 1px solid var(--line); background: #fff; border-radius: 8px; margin-bottom: 10px; }
+        .panel { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; margin-bottom: 12px; box-shadow: var(--shadow); }
         .actions, .tabs, form.inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        button, input, select { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); padding: 0 10px; font: inherit; font-size: 14px; }
+        button, input, select { min-height: 38px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); padding: 0 11px; font: inherit; font-size: 14px; }
         input { min-width: 0; width: 100%; }
         button { cursor: pointer; font-weight: 600; transition: background .16s ease, border-color .16s ease, color .16s ease; }
         button:hover { border-color: #aab6bf; background: #f6f8fa; }
@@ -1547,18 +1651,22 @@ def page() -> str:
         button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
         button.primary { background: var(--accent); color: white; border-color: var(--accent); }
         button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-        .tabs button { min-width: 86px; }
+        button.ghost { min-height: 32px; background: transparent; }
+        button.danger { color: var(--danger); border-color: #efc8c8; }
+        button.danger:hover { background: var(--danger-bg); border-color: #e9aaaa; }
+        .tabs { margin: 8px 0 4px; }
+        .tabs button { min-width: 86px; background: #f9fbfd; }
         .link { color: var(--accent); font-size: 13px; font-weight: 600; }
         .library-list { display: grid; gap: 2px; margin-top: 8px; }
         .list-count { padding: 4px 2px 6px; }
         .resource-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 10px 0; }
-        .resource-row { width: 100%; min-height: 48px; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 9px 2px; }
+        .resource-row { width: 100%; min-height: 52px; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 10px 4px; }
         .resource-main { min-width: 0; }
         .resource-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .resource-row > span { flex: 0 0 auto; color: var(--accent); font-size: 12px; font-weight: 700; }
-        .resource-row:hover { background: #eef7f5; padding-left: 8px; padding-right: 8px; border-radius: 6px; }
-        .preview-card { border: 1px solid var(--line); border-radius: 8px; background: #fff; }
-        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 14px; border-bottom: 1px solid var(--line); }
+        .resource-row:hover { background: #e8f4f1; padding-left: 10px; padding-right: 10px; border-radius: 7px; }
+        .preview-card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 16px; border-bottom: 1px solid var(--soft-line); }
         .preview-head > div { min-width: 0; }
         .track-list { padding: 0 14px 6px; }
         .track-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center; }
@@ -1569,25 +1677,28 @@ def page() -> str:
         .compact-form label:nth-of-type(2) select { width: 120px; }
         .manual-download { display: grid; gap: 8px; width: 100%; }
         .manual-download h2 { margin-bottom: 0; }
-        .manual-download .settings { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(190px, 240px) minmax(140px, 190px) minmax(120px, 150px) auto; gap: 8px; align-items: end; }
+        .manual-download .settings { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(190px, 240px) minmax(140px, 190px) minmax(120px, 150px) auto; gap: 10px; align-items: end; }
         .manual-download label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-        .job-board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
+        .job-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); box-shadow: var(--shadow); }
         .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
         .job-top > div { min-width: 0; }
         .job-top strong { overflow-wrap: anywhere; }
+        .job-actions { display: grid; gap: 6px; justify-items: end; }
+        .cancel-form { margin: 0; }
         .notice-job { border-bottom: 0; padding-bottom: 0; }
-        .badge { flex: 0 0 auto; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; }
+        .badge { flex: 0 0 auto; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; background: var(--surface-soft); }
         .badge.done { color: var(--accent); border-color: var(--accent); }
         .badge.failed { color: var(--danger); border-color: var(--danger); }
         .badge.running { color: var(--warn); border-color: var(--warn); }
+        .badge.canceling, .badge.canceled { color: #607184; border-color: #aebac5; }
         .meter { height: 6px; background: #e8ecef; border-radius: 999px; overflow: hidden; margin: 8px 0; }
         .meter span { display: block; height: 100%; background: var(--accent); }
         .job-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
         .job-facts div { min-width: 0; }
         .job-facts dt { color: var(--muted); font-size: 11px; margin: 0 0 2px; }
         .job-facts dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
-        .job-path { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: #fbfbfc; }
+        .job-path { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
         .job-path span { color: var(--muted); font-size: 12px; }
         .job-path form, .result-row form { margin: 0; }
         .result-list { display: grid; gap: 8px; margin-top: 10px; }
@@ -1688,8 +1799,9 @@ def page() -> str:
             <h2>Descargas</h2>
             <div hx-get="/partials/jobs" hx-trigger="load, every 2s" hx-target="#jobs" hx-swap="outerHTML">
               <section id="jobs" class="job-board">
-                <div class="job-column"><h3>En cola</h3><p class="muted">Sin descargas en cola.</p></div>
+                <div class="job-column"><h3>En curso</h3><p class="muted">Sin descargas activas.</p></div>
                 <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
+                <div class="job-column"><h3>Canceladas</h3><p class="muted">Sin cancelaciones.</p></div>
                 <div class="job-column"><h3>Errores</h3><p class="muted">Sin errores.</p></div>
               </section>
             </div>
@@ -1700,7 +1812,7 @@ def page() -> str:
         <section id="status-bar" class="status-bar">
           <div><strong>Terminal</strong><p>Sin actividad</p></div>
           <div><strong>Descarga actual</strong><p>Ninguna</p></div>
-          <div><strong>Progreso</strong><p>0 activas · 0 en cola · 0 completas · 0 errores</p></div>
+          <div><strong>Progreso</strong><p>0 activas · 0 en cola · 0 cancelando · 0 completas · 0 canceladas · 0 errores</p></div>
         </section>
       </div>
     </body>

@@ -1,5 +1,14 @@
 # Notas de actualización
 
+## v1.1.8
+
+- Se modernizó la interfaz desktop con superficies más claras, header renovado,
+  sombras sutiles y una distribución de descargas en cuatro estados.
+- Se agregó cancelación de descargas en curso o en cola desde la tarjeta del job.
+- La cancelación ahora es cooperativa: corta descargas activas, limpia temporales
+  y mueve el trabajo a la columna Canceladas.
+- La barra de estado muestra conteos de cancelación y trabajos cancelados.
+
 ## v1.1.7
 
 - La app desktop ya no depende del CDN de HTMX para operar la interfaz local.

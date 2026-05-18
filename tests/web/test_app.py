@@ -11,6 +11,7 @@ from tiddl.web.app import (
     clamp_concurrency,
     clean_path_segment,
     create_app,
+    finalize_canceled_job,
     finalize_job,
     format_bytes,
     get_all_web_playlists,
@@ -18,6 +19,7 @@ from tiddl.web.app import (
     parse_supported_resource,
     render_library,
     render_job,
+    request_job_cancel,
     strip_rich,
     web_playlist_folder,
     web_playlist_item_filename,
@@ -40,7 +42,7 @@ def test_jobs_panel_renders_empty_queue():
     response = client.get("/partials/jobs")
 
     assert response.status_code == 200
-    assert "Sin descargas en cola" in response.text
+    assert "Sin descargas activas" in response.text
 
 
 def test_jobs_panel_renders_existing_job():
@@ -98,6 +100,7 @@ def test_job_card_renders_aligned_download_details():
     assert "job-path" in html
     assert "/tmp/tiddl/playlist/My Playlist" in html
     assert "result-row" in html
+    assert "/jobs/abc/cancel" in html
 
 
 def test_strip_rich_removes_known_tags():
@@ -279,6 +282,43 @@ def test_render_job_progress_is_clamped():
     html = render_job(job)
 
     assert "width: 100%" in html
+
+
+def test_request_job_cancel_marks_job_as_canceling():
+    job = DownloadJob(id="abc", resource="playlist/123", status="running")
+
+    did_cancel = request_job_cancel(job)
+
+    assert did_cancel is True
+    assert job.cancel_requested is True
+    assert job.status == "canceling"
+    assert "Cancelación solicitada" in job.terminal[-1]
+
+
+def test_finalize_canceled_job_sets_terminal_state():
+    job = DownloadJob(id="abc", resource="playlist/123", status="canceling")
+
+    finalize_canceled_job(job)
+
+    assert job.status == "canceled"
+    assert job.message == "Cancelada por el usuario"
+    assert job.active_items == {}
+
+
+def test_cancel_job_endpoint_marks_existing_job_canceling():
+    state = WebState()
+    state.jobs["abc"] = DownloadJob(
+        id="abc",
+        resource="playlist/123",
+        status="running",
+    )
+
+    client = TestClient(create_app(state))
+    response = client.post("/jobs/abc/cancel")
+
+    assert response.status_code == 200
+    assert state.jobs["abc"].cancel_requested is True
+    assert "Cancelando" in response.text
 
 
 def make_track() -> Track:
