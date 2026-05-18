@@ -1,5 +1,15 @@
 # Notas de actualización
 
+## v1.1.13
+
+- Las descargas de playlist ahora muestran el nombre real de la playlist en la
+  tarjeta del job cuando la API ya lo conoce, dejando el recurso técnico como
+  detalle secundario.
+- Se agregó un divisor arrastrable entre Vista previa y Descargas para ajustar
+  el alto de ambas áreas en escritorio.
+- El mensaje de actualizaciones cuando aún no hay releases publicados en GitHub
+  queda resumido para no ensuciar el header.
+
 ## v1.1.12
 
 - Se integró el logo de Tiddl DDJ en el encabezado de la app desktop.

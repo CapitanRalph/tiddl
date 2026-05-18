@@ -74,6 +74,8 @@ def test_page_renders_direct_download_full_width():
     assert "Tiddl DDJ" in html
     assert html.count("Psybots") == 1
     assert "/assets/tiddl-ddj-logo.png" in html
+    assert "pane-resizer" in html
+    assert "--queue-pane-height" in html
     assert '<section class="direct-bar">' in html
     assert html.index("Descarga directa") < html.index("<main>")
     assert "__TRACK_QUALITY_OPTIONS__" not in html
@@ -171,6 +173,22 @@ def test_job_card_renders_aligned_download_details():
     assert "/tmp/tiddl/playlist/My Playlist" in html
     assert "result-row" in html
     assert "/jobs/abc/cancel" in html
+
+
+def test_job_card_prefers_playlist_display_name():
+    job = DownloadJob(
+        id="abc",
+        resource="playlist/ae6e9bf6-b4f9-4e4d-bfff-f6a5b3be26af",
+        display_name="Aphex Twin - Classics",
+        status="running",
+        message="Tamphex 16-bit, 44.1 kHz",
+    )
+
+    html = render_job(job)
+
+    assert "Aphex Twin - Classics" in html
+    assert "job-resource" in html
+    assert "playlist/ae6e9bf6-b4f9-4e4d-bfff-f6a5b3be26af" in html
 
 
 def test_strip_rich_removes_known_tags():

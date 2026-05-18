@@ -68,6 +68,7 @@ class JobResult:
 class DownloadJob:
     id: str
     resource: str
+    display_name: str = ""
     output_format: AudioOutputFormat = "raw"
     concurrency: int = 3
     track_quality: TRACK_QUALITY_LITERAL = "high"
@@ -332,7 +333,12 @@ def create_app(state: WebState | None = None) -> FastAPI:
             return render_update_panel(check_for_update())
         except Exception as exc:
             log.warning("could not check update: %s", exc)
-            return render_update_error(f"No pudimos revisar actualizaciones: {exc}")
+            message = (
+                "Sin releases publicados"
+                if "404" in str(exc)
+                else "No pudimos revisar actualizaciones"
+            )
+            return render_update_error(message)
 
     @app.post("/update/install", response_class=HTMLResponse)
     def update_install() -> str:
@@ -959,6 +965,7 @@ async def download_resource(
             raise_if_job_canceled(job)
             track = api.get_track(resource.id)
             album = api.get_album(track.album.id)
+            job.display_name = track_display_name(track)
             await handle_item(
                 track,
                 format_template(
@@ -979,6 +986,7 @@ async def download_resource(
         case "album":
             raise_if_job_canceled(job)
             album = api.get_album(resource.id)
+            job.display_name = album.title
             await download_album(
                 api,
                 album,
@@ -991,6 +999,7 @@ async def download_resource(
         case "playlist":
             raise_if_job_canceled(job)
             playlist = api.get_playlist(resource.id)
+            job.display_name = playlist.title
             playlist_folder = web_playlist_folder(playlist)
             job.target_path = str(CONFIG.download.download_path / playlist_folder)
             job.terminal.append(f"Destino de playlist: {job.target_path}")
@@ -1080,6 +1089,14 @@ def clean_path_segment(value: str) -> str:
     value = re.sub(r"\s{2,}", " ", value)
     value = value.strip()
     return value or "_"
+
+
+def track_display_name(track: Track) -> str:
+    title = f"{track.title} ({track.version})" if track.version else track.title
+    if track.artist:
+        return f"{track.artist.name} - {title}"
+
+    return title
 
 
 async def download_album(
@@ -1557,11 +1574,18 @@ def render_job(job: DownloadJob) -> str:
     target_path = job.target_path or str(CONFIG.download.download_path)
     warnings = skipped_result_count(job)
     warning_text = f" · {warnings} omitidos" if warnings else ""
+    title = job.display_name or job.resource
+    resource_hint = (
+        f'<p class="job-resource muted">{escape(job.resource)}</p>'
+        if job.display_name and job.display_name != job.resource
+        else ""
+    )
     return f"""
     <article class="job">
       <div class="job-top">
         <div>
-          <strong>{escape(job.resource)}</strong>
+          <strong>{escape(title)}</strong>
+          {resource_hint}
           <p class="muted">{escape(job.message)}</p>
         </div>
         <div class="job-actions">
@@ -1960,6 +1984,42 @@ def page() -> str:
             root.querySelectorAll?.("[hx-trigger]").forEach(initTrigger);
           };
 
+          const initPaneResizer = () => {
+            const workspace = document.querySelector(".workspace");
+            const handle = document.querySelector(".pane-resizer");
+            if (!workspace || !handle) return;
+
+            const setQueueHeight = (clientY) => {
+              const rect = workspace.getBoundingClientRect();
+              const height = rect.bottom - clientY;
+              const min = 190;
+              const max = Math.max(min, rect.height - 180);
+              const next = Math.min(Math.max(height, min), max);
+              workspace.style.setProperty("--queue-pane-height", `${Math.round(next)}px`);
+            };
+
+            handle.addEventListener("pointerdown", (event) => {
+              event.preventDefault();
+              handle.setPointerCapture(event.pointerId);
+              document.body.classList.add("resizing-panes");
+            });
+
+            handle.addEventListener("pointermove", (event) => {
+              if (!handle.hasPointerCapture(event.pointerId)) return;
+              setQueueHeight(event.clientY);
+            });
+
+            const stop = (event) => {
+              if (handle.hasPointerCapture(event.pointerId)) {
+                handle.releasePointerCapture(event.pointerId);
+              }
+              document.body.classList.remove("resizing-panes");
+            };
+
+            handle.addEventListener("pointerup", stop);
+            handle.addEventListener("pointercancel", stop);
+          };
+
           document.addEventListener("submit", (event) => {
             const form = event.target.closest("form[hx-post]");
             if (!form) return;
@@ -1978,7 +2038,10 @@ def page() -> str:
             }
           });
 
-          document.addEventListener("DOMContentLoaded", () => bind(document));
+          document.addEventListener("DOMContentLoaded", () => {
+            bind(document);
+            initPaneResizer();
+          });
         })();
       </script>
       <style>
@@ -2002,9 +2065,12 @@ def page() -> str:
         .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 8px 24px rgba(24, 35, 45, .04); z-index: 1; }
         main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; overflow: hidden; }
         aside { border-right: 1px solid var(--line); padding: 14px 12px; background: var(--panel); overflow: auto; }
-        .workspace { display: grid; grid-template-rows: minmax(0, 1fr) minmax(210px, 34vh); min-height: 0; height: 100%; overflow: hidden; }
+        .workspace { --queue-pane-height: 34vh; display: grid; grid-template-rows: minmax(150px, 1fr) 7px minmax(190px, var(--queue-pane-height)); min-height: 0; height: 100%; overflow: hidden; }
         section.preview-pane, section.queue-pane { min-height: 0; padding: 16px 18px; overflow: auto; font-size: 13px; }
-        section.preview-pane { border-bottom: 1px solid var(--line); }
+        .pane-resizer { min-height: 7px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #eef3f7, #dce7ee); cursor: row-resize; touch-action: none; }
+        .pane-resizer:hover, .pane-resizer:focus-visible { background: #cfe0e8; outline: none; }
+        .pane-resizer::before { content: ""; display: block; width: 46px; height: 3px; margin: 1px auto 0; border-radius: 999px; background: #9aadb8; }
+        .resizing-panes { cursor: row-resize; user-select: none; }
         h1 { font-size: 18px; line-height: 1.2; margin: 0; white-space: nowrap; }
         .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid #375260; border-radius: 999px; font-size: 12px; color: #8ce0d1; background: #17242d; vertical-align: middle; }
         h2 { font-size: 16px; line-height: 1.25; margin: 0 0 6px; }
@@ -2101,7 +2167,8 @@ def page() -> str:
           .header-meta { align-items: flex-start; flex-direction: column; gap: 6px; }
           .app-subtitle { text-align: left; }
           main { grid-template-columns: 1fr; height: auto; }
-          section.workspace { grid-template-rows: auto auto; }
+          section.workspace { grid-template-rows: auto auto auto; }
+          .pane-resizer { display: none; }
           aside { border-right: 0; border-bottom: 1px solid var(--line); }
           .panel, .preview-head { align-items: stretch; flex-direction: column; }
           .download-form, .compact-form { display: grid; grid-template-columns: 1fr; }
@@ -2193,6 +2260,7 @@ def page() -> str:
               </section>
             </div>
           </section>
+          <div class="pane-resizer" role="separator" aria-orientation="horizontal" aria-label="Redimensionar vista previa y descargas" tabindex="0"></div>
           <section class="queue-pane">
             <h2>Descargas</h2>
             <div hx-get="/partials/jobs" hx-trigger="load, every 2s" hx-target="#jobs" hx-swap="outerHTML">
