@@ -169,6 +169,35 @@ tiddl desktop
 > no abre la ventana nativa, actualiza Microsoft Edge WebView2 Runtime o ejecuta
 > `tiddl desktop --browser`.
 
+# Mantener la app actualizada
+
+Este fork se instala desde GitHub, así que para traer los últimos cambios basta
+con reinstalar la herramienta desde el mismo origen. En cualquier sistema
+(Linux, macOS y Windows):
+
+```bash
+uv tool install --force "git+https://github.com/CapitanRalph/tiddl.git"
+```
+
+El flag `--force` reinstala la última versión de la rama `main` aunque ya tengas
+`tiddl` instalado. Como alternativa también puedes usar:
+
+```bash
+uv tool upgrade tiddl
+```
+
+Después de actualizar, confirma la versión y vuelve a abrir la app:
+
+```bash
+tiddl --version
+tiddl desktop
+```
+
+> [!NOTE]
+> Si instalaste con los instaladores `.dmg`/`.exe`, actualiza desde el propio
+> botón de actualización dentro de la app desktop o descarga el instalador más
+> reciente desde GitHub Releases.
+
 ## Instalación para desarrollo
 
 Si quieres modificar el código, clona el fork e instala el paquete en modo

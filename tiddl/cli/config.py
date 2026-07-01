@@ -8,13 +8,13 @@ from tiddl.cli.const import APP_PATH
 from tiddl.core.utils.const import TRACK_QUALITY_LITERAL, VIDEO_QUALITY_LITERAL
 
 CONFIG_FILENAME = "config.toml"
-DEFAULT_DOWNLOAD_PATH = Path.home() / "Music" / "tiddl"
+DEFAULT_DOWNLOAD_PATH = Path.home() / "Music" / "Tiddl DDJ"
 DEFAULT_REKORDBOX_TEMPLATE = (
-    "{album.artist}/{album.title}/{item.number:02d} - {item.artist} - "
+    "{album.artist}/{album.title}/{item.number} - {item.artist} - "
     "{item.title_version}"
 )
 DEFAULT_REKORDBOX_PLAYLIST_TEMPLATE = (
-    "playlist/{playlist.title}/{playlist.index:03d} - {item.artist} - "
+    "playlist/{playlist.title}/{playlist.index} - {item.artist} - "
     "{item.title_version}"
 )
 

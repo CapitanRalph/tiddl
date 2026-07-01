@@ -27,6 +27,7 @@ from tiddl.cli.config import (
 )
 from tiddl.cli.commands.download.downloader import DownloadCancelled, Downloader
 from tiddl.cli.const import APP_PATH
+from tiddl.cli.utils.download import get_existing_track_filename
 from tiddl.cli.utils.auth import AuthData, load_auth_data, save_auth_data
 from tiddl.cli.utils.resource import TidalResource
 from tiddl.core.api import TidalAPI, TidalClient, ApiError
@@ -896,6 +897,31 @@ async def download_resource(
         metadata = metadata or MetadataPayload()
         completed_before = job.completed
 
+        # The core downloader only predicts .flac/.m4a source files, so it can
+        # never detect a track we already converted to .mp3/.wav on disk. Detect
+        # it here so skip_existing works and completed MP3/WAV downloads show up
+        # instead of being downloaded again on every run.
+        converted_ext = output_format_extension(output_format)
+        if (
+            CONFIG.download.skip_existing
+            and converted_ext is not None
+            and isinstance(item, Track)
+        ):
+            predicted_source = get_existing_track_filename(
+                item.audioQuality, track_quality, Path(file_path)
+            )
+            existing_converted = downloader.get_path(
+                CONFIG.download.scan_path, predicted_source
+            ).with_suffix(converted_ext)
+            if existing_converted.exists():
+                output.show_item_result(
+                    result_message="[yellow]Exists",
+                    item_description=item.title,
+                    item_path=existing_converted,
+                )
+                output.mark_item_processed()
+                return existing_converted, item
+
         try:
             path, was_downloaded = await downloader.download(item, Path(file_path))
         except DownloadCancelled:
@@ -1071,7 +1097,7 @@ def web_playlist_item_filename(
 ) -> Path:
     return Path(
         format_template(
-            "{playlist.index:03d} - {item.artist} - {item.title_version}",
+            "{playlist.index} - {item.artist} - {item.title_version}",
             item=item,
             album=album,
             playlist=playlist,
@@ -1155,6 +1181,17 @@ def get_item_quality(
         return track_qualities[track_quality]
 
     return video_qualities[video_quality]
+
+
+def output_format_extension(output_format: AudioOutputFormat) -> str | None:
+    """Final extension for converted audio, or None when kept as-is ("raw")."""
+    match output_format:
+        case "mp3_320":
+            return ".mp3"
+        case "wav":
+            return ".wav"
+        case _:
+            return None
 
 
 def convert_track_output(path: Path, output_format: AudioOutputFormat) -> Path:
@@ -1393,7 +1430,6 @@ def render_preview(api: TidalAPI, resource: TidalResource) -> str:
         <div>
           <h2>{escape(title)}</h2>
           <p class="muted">{escape(meta)}</p>
-          <code>{escape(str(resource))}</code>
         </div>
         {download_form(str(resource), compact=False)}
       </div>
@@ -1488,10 +1524,18 @@ def render_jobs(state: WebState, notice: str = "") -> str:
         </section>
         """.replace("__NOTICE__", notice_html)
 
-    queued = [job for job in jobs if job.status in ("queued", "running", "canceling")]
+    # Columns are mutually exclusive: an active job (queued/running/canceling)
+    # stays only in "En curso" even if a single item already errored. It moves
+    # to "Errores" only once it finishes (status failed, or done with errors).
+    active_states = ("queued", "running", "canceling")
+    queued = [job for job in jobs if job.status in active_states]
     done = [job for job in jobs if job.status == "done" and not has_job_errors(job)]
     canceled = [job for job in jobs if job.status == "canceled"]
-    failed = [job for job in jobs if job.status == "failed" or has_job_errors(job)]
+    failed = [
+        job
+        for job in jobs
+        if job.status == "failed" or (job.status == "done" and has_job_errors(job))
+    ]
     return f"""
     <section id="jobs" class="job-board">
       {render_job_column("En curso", queued)}
@@ -1584,7 +1628,7 @@ def render_job(job: DownloadJob) -> str:
     <article class="job">
       <div class="job-top">
         <div>
-          <strong>{escape(title)}</strong>
+          <strong title="{escape(title)}">{escape(title)}</strong>
           {resource_hint}
           <p class="muted">{escape(job.message)}</p>
         </div>
@@ -1594,17 +1638,13 @@ def render_job(job: DownloadJob) -> str:
         </div>
       </div>
       <div class="meter"><span style="width: {percent}%"></span></div>
-      <dl class="job-facts">
-        <div><dt>Progreso</dt><dd>{job.completed}/{job.total or "?"} ítems{warning_text}</dd></div>
-        <div><dt>Datos</dt><dd>{format_bytes(job.bytes_downloaded)}</dd></div>
-        <div><dt>Formato</dt><dd>{escape(job.output_format.upper())}</dd></div>
-        <div><dt>Audio</dt><dd>{escape(job.track_quality.upper())}</dd></div>
-        <div><dt>Video</dt><dd>{escape(job.video_quality.upper())}</dd></div>
-        <div><dt>Paralelo</dt><dd>{job.concurrency}x auto</dd></div>
-      </dl>
+      <div class="job-meta">
+        <span><strong>{job.completed}/{job.total or "?"}</strong> ítems{warning_text}</span>
+        <span>{format_bytes(job.bytes_downloaded)}</span>
+        <span>{escape(job.output_format.upper())} · {escape(job.track_quality.upper())} · {job.concurrency}x</span>
+      </div>
       <div class="job-path">
-        <span>Destino</span>
-        <code>{escape(target_path)}</code>
+        <code title="{escape(target_path)}">{escape(target_path)}</code>
         <form hx-post="/open-folder" hx-target="#status-bar" hx-swap="outerHTML">
           <input type="hidden" name="path" value="{escape(target_path)}">
           <button>Abrir carpeta</button>
@@ -1629,8 +1669,8 @@ def render_job_result(result: JobResult) -> str:
     return f"""
     <div class="result-row">
       <span class="result-status">{escape(result.status)}</span>
-      <strong>{escape(result.title)}</strong>
-      <code>{escape(result.path or "Sin archivo")}</code>
+      <strong title="{escape(result.title)}">{escape(result.title)}</strong>
+      <code title="{escape(result.path or "Sin archivo")}">{escape(result.path or "Sin archivo")}</code>
       {open_button}
     </div>
     """
@@ -1816,7 +1856,7 @@ def render_status(state: WebState) -> str:
       </div>
       <div>
         <strong>Progreso</strong>
-        <p>{len(running)} activas · {len(queued)} en cola · {len(canceling)} cancelando · {len(done)} completas · {len(canceled)} canceladas · {len(failed)} errores · log {escape(str(APP_PATH / "latest.log"))}</p>
+        <p>{len(running)} activas · {len(queued)} en cola · {len(done)} completas · {len(canceled)} canceladas · {len(failed)} errores</p>
       </div>
     </section>
     """
@@ -1843,10 +1883,9 @@ def render_status_message(message: str) -> str:
 
 def render_update_panel(info: UpdateInfo) -> str:
     if not info.available:
-        return f"""
+        return """
         <section id="update-panel" class="update-panel">
-          <span>{escape(APP_VERSION)}</span>
-          <small>Actualizado</small>
+          <small>✓ Última versión</small>
         </section>
         """
 
@@ -2045,43 +2084,71 @@ def page() -> str:
         })();
       </script>
       <style>
-        :root { color-scheme: light; --ink: #162029; --muted: #61707f; --line: #d7e0e7; --soft-line: #edf2f6; --panel: #eef3f7; --surface: #ffffff; --surface-soft: #f8fafc; --accent: #0b806c; --accent-hover: #066c5c; --danger: #b33a3a; --danger-bg: #fff1f1; --warn: #98690d; --focus: #85d6ca; --shadow: 0 14px 34px rgba(18, 35, 49, .08); }
+        /* ---- Design tokens: one coherent type + spacing scale ---- */
+        :root {
+          color-scheme: light;
+          --ink: #162029; --muted: #61707f; --line: #d7e0e7; --soft-line: #edf2f6;
+          --panel: #eef3f7; --surface: #ffffff; --surface-soft: #f8fafc;
+          --accent: #0b806c; --accent-hover: #066c5c; --danger: #b33a3a;
+          --danger-bg: #fff1f1; --warn: #98690d; --focus: #85d6ca;
+          --shadow: 0 10px 26px rgba(18, 35, 49, .07);
+          --dark: #101820; --dark-soft: #17242d; --dark-line: #243642; --on-dark: #f6fafb; --on-dark-muted: #9fb1bb;
+          /* type scale */
+          --fs-h1: 17px; --fs-h2: 15px; --fs-h3: 12px; --fs-base: 13px; --fs-sm: 12px; --fs-xs: 11px;
+          /* spacing scale */
+          --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px;
+          --radius: 8px; --radius-sm: 6px; --control-h: 36px;
+        }
         * { box-sizing: border-box; }
-        html { height: 100%; background: #101820; }
-        body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f2f6f8; color: var(--ink); overflow: hidden; }
-        header { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 22px; border-bottom: 1px solid #243642; background: #101820; color: #f6fafb; }
-        .brand-block { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
-        .brand-logo { width: 34px; height: 34px; object-fit: contain; border-radius: 8px; background: #f6fafb; padding: 3px; align-self: center; }
-        .header-meta { display: flex; align-items: center; justify-content: flex-end; gap: 14px; min-width: 0; }
-        .app-subtitle { text-align: right; color: #b7c5cd; }
-        .update-panel { min-height: 32px; display: flex; align-items: center; gap: 10px; justify-content: flex-end; color: #dce8ec; font-size: 12px; }
+        html { height: 100%; background: var(--dark); }
+        body { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; height: 100%; margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: var(--fs-base); background: #f2f6f8; color: var(--ink); overflow: hidden; }
+
+        /* ---- Header (slim, single bar) ---- */
+        header { height: 52px; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); padding: 0 var(--sp-5); border-bottom: 1px solid var(--dark-line); background: var(--dark); color: var(--on-dark); }
+        .brand-block { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+        .brand-logo { width: 30px; height: 30px; object-fit: contain; border-radius: var(--radius-sm); background: var(--on-dark); padding: 3px; }
+        h1 { font-size: var(--fs-h1); line-height: 1; margin: 0; white-space: nowrap; font-weight: 700; }
+        .version-badge { display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border: 1px solid #375260; border-radius: 999px; font-size: var(--fs-xs); color: #8ce0d1; background: var(--dark-soft); }
+        .header-meta { display: flex; align-items: center; justify-content: flex-end; gap: var(--sp-3); min-width: 0; }
+        .app-subtitle { text-align: right; color: var(--on-dark-muted); font-size: var(--fs-xs); }
+        .update-panel { display: flex; align-items: center; gap: var(--sp-2); justify-content: flex-end; color: #dce8ec; font-size: var(--fs-xs); }
         .update-panel span { font-weight: 700; }
-        .update-panel small { display: block; color: #9fb1bb; font-size: 11px; line-height: 1.2; }
+        .update-panel small { color: var(--on-dark-muted); font-size: var(--fs-xs); line-height: 1.2; }
         .update-panel a { color: #8ce0d1; font-weight: 700; text-decoration: none; }
         .update-panel form { margin: 0; }
-        .update-panel.warning span { color: #ffdca2; }
-        .update-button { min-height: 30px; border-color: #375260; color: #8ce0d1; background: #17242d; }
+        .update-panel.warning span, .update-panel.available span { color: #ffdca2; }
+        .update-button { min-height: 28px; border-color: #375260; color: #8ce0d1; background: var(--dark-soft); }
         .update-button:hover { border-color: #578092; background: #1d303b; }
-        .direct-bar { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 8px 24px rgba(24, 35, 45, .04); z-index: 1; }
-        main { display: grid; grid-template-columns: minmax(300px, 360px) minmax(560px, 1fr); min-height: 0; overflow: hidden; }
-        aside { border-right: 1px solid var(--line); padding: 14px 12px; background: var(--panel); overflow: auto; }
-        .workspace { --queue-pane-height: 34vh; display: grid; grid-template-rows: minmax(150px, 1fr) 7px minmax(190px, var(--queue-pane-height)); min-height: 0; height: 100%; overflow: hidden; }
-        section.preview-pane, section.queue-pane { min-height: 0; padding: 16px 18px; overflow: auto; font-size: 13px; }
+
+        /* ---- Direct download bar (compact single row) ---- */
+        .direct-bar { padding: var(--sp-2) var(--sp-5); border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 6px 18px rgba(24, 35, 45, .03); z-index: 1; }
+        .manual-download { display: flex; align-items: end; gap: var(--sp-3); width: 100%; flex-wrap: wrap; }
+        .manual-download h2 { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; align-self: center; }
+        .manual-download .settings { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 130px 130px auto; gap: var(--sp-2); align-items: end; flex: 1; min-width: 0; }
+        .manual-download label { display: grid; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); }
+
+        /* ---- Main working area ---- */
+        main { display: grid; grid-template-columns: minmax(260px, 320px) minmax(520px, 1fr); min-height: 0; overflow: hidden; }
+        aside { border-right: 1px solid var(--line); padding: var(--sp-3); background: var(--panel); overflow: auto; }
+        .workspace { --queue-pane-height: 45vh; display: grid; grid-template-rows: minmax(140px, 1fr) 7px minmax(180px, var(--queue-pane-height)); min-height: 0; height: 100%; overflow: hidden; }
+        section.preview-pane, section.queue-pane { min-height: 0; padding: var(--sp-4); overflow: auto; }
+        .queue-pane { background: var(--surface-soft); }
         .pane-resizer { min-height: 7px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #eef3f7, #dce7ee); cursor: row-resize; touch-action: none; }
         .pane-resizer:hover, .pane-resizer:focus-visible { background: #cfe0e8; outline: none; }
         .pane-resizer::before { content: ""; display: block; width: 46px; height: 3px; margin: 1px auto 0; border-radius: 999px; background: #9aadb8; }
         .resizing-panes { cursor: row-resize; user-select: none; }
-        h1 { font-size: 18px; line-height: 1.2; margin: 0; white-space: nowrap; }
-        .version-badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; margin-left: 8px; border: 1px solid #375260; border-radius: 999px; font-size: 12px; color: #8ce0d1; background: #17242d; vertical-align: middle; }
-        h2 { font-size: 16px; line-height: 1.25; margin: 0 0 6px; }
-        h3 { font-size: 13px; line-height: 1.3; margin: 0 0 8px; }
-        .muted { color: var(--muted); margin: 0; font-size: 13px; line-height: 1.45; }
-        .preview-pane h2, .queue-pane h2 { font-size: 15px; margin-bottom: 5px; }
-        .preview-pane h3, .queue-pane h3 { font-size: 12px; margin-bottom: 6px; }
-        .preview-pane .muted, .queue-pane .muted { font-size: 12px; line-height: 1.35; }
-        .panel { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; margin-bottom: 12px; box-shadow: var(--shadow); }
-        .actions, .tabs, form.inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        button, input, select { min-height: 38px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); padding: 0 11px; font: inherit; font-size: 14px; }
+
+        /* ---- Typography ---- */
+        h2 { font-size: var(--fs-h2); line-height: 1.25; margin: 0 0 var(--sp-2); font-weight: 700; }
+        h3 { font-size: var(--fs-h3); line-height: 1.3; margin: 0 0 var(--sp-2); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+        .muted { color: var(--muted); margin: 0; font-size: var(--fs-sm); line-height: 1.4; }
+        .preview-pane h2, .queue-pane h2 { font-size: var(--fs-h2); }
+        .link { color: var(--accent); font-size: var(--fs-sm); font-weight: 600; }
+
+        /* ---- Controls ---- */
+        .panel { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); padding: var(--sp-3); border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius); margin-bottom: var(--sp-3); box-shadow: var(--shadow); }
+        .actions, .tabs, form.inline { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
+        button, input, select { min-height: var(--control-h); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); padding: 0 11px; font: inherit; font-size: var(--fs-base); }
         input { min-width: 0; width: 100%; }
         button { cursor: pointer; font-weight: 600; transition: background .16s ease, border-color .16s ease, color .16s ease; }
         button:hover { border-color: #aab6bf; background: #f6f8fa; }
@@ -2089,95 +2156,105 @@ def page() -> str:
         button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
         button.primary { background: var(--accent); color: white; border-color: var(--accent); }
         button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-        button.ghost { min-height: 32px; background: transparent; }
+        button.ghost { min-height: 30px; background: transparent; }
         button.danger { color: var(--danger); border-color: #efc8c8; }
         button.danger:hover { background: var(--danger-bg); border-color: #e9aaaa; }
-        .tabs { margin: 8px 0 4px; }
-        .tabs button { min-width: 86px; background: #f9fbfd; }
-        .link { color: var(--accent); font-size: 13px; font-weight: 600; }
-        .library-list, .file-list { display: grid; gap: 2px; margin-top: 8px; }
-        .list-count { padding: 4px 2px 6px; }
-        .resource-row, .file-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: 10px 0; }
-        .resource-row { width: 100%; min-height: 52px; display: flex; justify-content: space-between; gap: 10px; align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 10px 4px; }
+        .tabs { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--sp-2); margin: var(--sp-2) 0 var(--sp-1); }
+        .tabs button { min-width: 0; background: #f9fbfd; }
+
+        /* ---- Library / file lists ---- */
+        .library-list, .file-list { display: grid; gap: 1px; margin-top: var(--sp-2); }
+        .list-count { padding: var(--sp-1) 2px var(--sp-2); font-size: var(--fs-xs); }
+        .resource-row, .file-row, .job, .track-row { border-bottom: 1px solid var(--line); padding: var(--sp-2) 0; }
+        .resource-row { width: 100%; min-height: 48px; display: flex; justify-content: space-between; gap: var(--sp-2); align-items: center; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: var(--sp-2) var(--sp-1); }
         .resource-main { min-width: 0; }
-        .resource-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .resource-row > span { flex: 0 0 auto; color: var(--accent); font-size: 12px; font-weight: 700; }
-        .resource-row:hover { background: #e8f4f1; padding-left: 10px; padding-right: 10px; border-radius: 7px; }
-        .file-explorer { display: grid; gap: 10px; }
-        .path-settings { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
-        .path-settings label { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--muted); }
-        .explorer-summary { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+        .resource-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-base); }
+        .resource-row > span { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-xs); font-weight: 700; }
+        .resource-row:hover { background: #e8f4f1; padding-left: var(--sp-2); padding-right: var(--sp-2); border-radius: var(--radius-sm); }
+        .file-explorer { display: grid; gap: var(--sp-2); }
+        .path-settings { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-2); align-items: end; padding: var(--sp-2); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+        .path-settings label { display: grid; gap: var(--sp-1); min-width: 0; font-size: var(--fs-xs); color: var(--muted); }
+        .explorer-summary { display: flex; justify-content: space-between; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-2); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
         .explorer-summary > div { min-width: 0; }
-        .explorer-nav { display: flex; gap: 8px; align-items: center; min-width: 0; }
+        .explorer-nav { display: flex; gap: var(--sp-2); align-items: center; min-width: 0; }
         .explorer-nav code { flex: 1; min-width: 0; }
-        .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
-        .file-row strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+        .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-2); align-items: center; }
+        .file-row strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-base); }
         .file-row form { margin: 0; }
-        .preview-card { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
-        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--soft-line); }
+
+        /* ---- Preview ---- */
+        .preview-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+        .preview-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--sp-4); padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--soft-line); }
         .preview-head > div { min-width: 0; }
-        .track-list { padding: 0 12px 4px; }
-        .track-row { display: grid; grid-template-columns: 30px 1fr auto; gap: 10px; align-items: center; padding: 8px 0; }
-        .track-row strong, .job-top strong { font-size: 13px; line-height: 1.3; }
-        .download-form, .compact-form { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
-        .download-form label, .compact-form label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-        .compact-form select { width: 96px; }
-        .compact-form label:first-of-type select { width: 150px; }
-        .compact-form label:nth-of-type(2) select { width: 120px; }
-        .manual-download { display: grid; gap: 8px; width: 100%; }
-        .manual-download h2 { margin-bottom: 0; }
-        .manual-download .settings { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(190px, 240px) minmax(140px, 190px) minmax(120px, 150px) auto; gap: 10px; align-items: end; }
-        .manual-download label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
-        .job-board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--surface); box-shadow: var(--shadow); }
-        .job { padding: 8px 0; }
-        .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+        .track-list { padding: 0 var(--sp-3) var(--sp-1); }
+        .track-row { display: grid; grid-template-columns: 26px 1fr auto; gap: var(--sp-2); align-items: center; padding: var(--sp-2) 0; }
+        .track-row > span { color: var(--muted); font-size: var(--fs-sm); font-weight: 600; }
+        .track-row strong, .job-top strong { font-size: var(--fs-base); line-height: 1.3; }
+        .download-form, .compact-form { display: flex; gap: var(--sp-2); align-items: end; flex-wrap: wrap; }
+        .download-form label, .compact-form label { display: grid; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); }
+        .compact-form select { width: 110px; }
+
+        /* ---- Job board (kanban) ---- */
+        .job-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-2); align-items: start; }
+        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--sp-2) var(--sp-3); background: var(--surface); box-shadow: var(--shadow); }
+        .job-column > h3 { position: sticky; top: 0; }
+        .job { padding: var(--sp-2) 0; }
+        .job + .job { border-top: 1px solid var(--soft-line); }
+        .job-top { display: flex; justify-content: space-between; gap: var(--sp-2); align-items: flex-start; }
         .job-top > div { min-width: 0; }
-        .job-top strong { overflow-wrap: anywhere; }
-        .job-actions { display: grid; gap: 6px; justify-items: end; }
+        .job-top strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .job-resource { font-size: var(--fs-xs); }
+        .job-actions { display: grid; gap: var(--sp-1); justify-items: end; flex: 0 0 auto; }
         .cancel-form { margin: 0; }
+        .cancel-form button { min-height: 26px; font-size: var(--fs-xs); padding: 0 8px; }
         .notice-job { border-bottom: 0; padding-bottom: 0; }
-        .badge { flex: 0 0 auto; font-size: 10px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; background: var(--surface-soft); }
+        .badge { flex: 0 0 auto; font-size: var(--fs-xs); border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; text-transform: uppercase; font-weight: 700; letter-spacing: .02em; background: var(--surface-soft); }
         .badge.done { color: var(--accent); border-color: var(--accent); }
         .badge.failed { color: var(--danger); border-color: var(--danger); }
         .badge.running { color: var(--warn); border-color: var(--warn); }
         .badge.canceling, .badge.canceled { color: #607184; border-color: #aebac5; }
-        .meter { height: 6px; background: #e8ecef; border-radius: 999px; overflow: hidden; margin: 8px 0; }
+        .meter { height: 5px; background: #e8ecef; border-radius: 999px; overflow: hidden; margin: var(--sp-2) 0; }
         .meter span { display: block; height: 100%; background: var(--accent); }
-        .job-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 8px 0; }
-        .job-facts div { min-width: 0; }
-        .job-facts dt { color: var(--muted); font-size: 10px; margin: 0 0 2px; }
-        .job-facts dd { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
-        .job-path { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
-        .job-path span { color: var(--muted); font-size: 11px; }
+        .job-meta { display: flex; flex-wrap: wrap; gap: 2px 8px; margin: var(--sp-2) 0; font-size: var(--fs-xs); color: var(--muted); }
+        .job-meta strong { color: var(--ink); font-weight: 600; }
+        .job-path { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-2); align-items: center; padding: var(--sp-2); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-soft); }
+        .job-path code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .job-path form, .result-row form { margin: 0; }
-        .result-list { display: grid; gap: 8px; margin-top: 10px; }
-        .result-row { display: grid; grid-template-columns: minmax(82px, auto) minmax(0, 1fr) auto; gap: 4px 8px; align-items: center; padding-bottom: 8px; border-bottom: 1px solid #eef1f3; }
-        .result-row code { grid-column: 1 / -1; }
-        .result-status { color: var(--muted); font-size: 11px; }
-        code { font-size: 11px; word-break: break-all; }
-        .error { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
-        .status-bar { height: 96px; display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 16px; padding: 12px 20px; border-top: 1px solid var(--line); background: #101820; color: #f4f7f8; }
-        .status-bar strong { display: block; font-size: 12px; color: #9fd7cc; margin-bottom: 4px; }
-        .status-bar p { margin: 0; font-size: 13px; line-height: 1.45; color: #e1e7ea; overflow-wrap: anywhere; }
-        @media (max-width: 920px) {
+        .job-path button, .result-row button { min-height: 28px; font-size: var(--fs-xs); padding: 0 8px; white-space: nowrap; }
+        .result-list { display: grid; gap: var(--sp-2); margin-top: var(--sp-2); }
+        .result-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 2px var(--sp-2); align-items: center; padding-bottom: var(--sp-2); border-bottom: 1px solid #eef1f3; }
+        .result-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .result-row code { grid-column: 1 / -1; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .result-status { color: var(--accent); font-size: var(--fs-xs); font-weight: 600; }
+        code { font-size: var(--fs-xs); word-break: break-all; }
+        .error { color: var(--danger); font-size: var(--fs-sm); margin: var(--sp-2) 0 0; }
+
+        /* ---- Status bar (slim, single line) ---- */
+        .status-bar { height: 40px; display: flex; align-items: center; gap: var(--sp-5); padding: 0 var(--sp-5); border-top: 1px solid var(--dark-line); background: var(--dark); color: #e1e7ea; font-size: var(--fs-sm); overflow: hidden; }
+        .status-bar > div { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
+        .status-bar > div:first-child { flex: 1 1 auto; }
+        .status-bar strong { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .04em; color: #9fd7cc; flex: 0 0 auto; }
+        .status-bar p { margin: 0; line-height: 1.2; color: #e1e7ea; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+        @media (max-width: 960px) {
           body { display: block; height: auto; overflow: auto; }
-          header { align-items: flex-start; flex-direction: column; gap: 6px; padding: 10px 20px; }
+          header { height: auto; align-items: flex-start; flex-direction: column; gap: var(--sp-1); padding: var(--sp-2) var(--sp-5); }
           h1 { white-space: normal; }
-          .header-meta { align-items: flex-start; flex-direction: column; gap: 6px; }
+          .header-meta { align-items: flex-start; flex-direction: column; gap: var(--sp-1); }
           .app-subtitle { text-align: left; }
           main { grid-template-columns: 1fr; height: auto; }
           section.workspace { grid-template-rows: auto auto auto; }
           .pane-resizer { display: none; }
           aside { border-right: 0; border-bottom: 1px solid var(--line); }
           .panel, .preview-head { align-items: stretch; flex-direction: column; }
-          .download-form, .compact-form { display: grid; grid-template-columns: 1fr; }
-          .download-form select, .compact-form select, .compact-form label:first-of-type select, .compact-form label:nth-of-type(2) select { width: 100%; }
-          .track-row { grid-template-columns: 34px 1fr; }
+          .manual-download { flex-direction: column; align-items: stretch; }
+          .download-form, .compact-form, .manual-download .settings { display: grid; grid-template-columns: 1fr; }
+          .download-form select, .compact-form select { width: 100%; }
+          .track-row { grid-template-columns: 26px 1fr; }
           .track-row form { grid-column: 1 / -1; }
-          .job-board, .status-bar { grid-template-columns: 1fr; }
-          .status-bar { height: auto; }
-          .manual-download .settings { grid-template-columns: 1fr; }
+          .job-board { grid-template-columns: 1fr; }
+          .status-bar { height: auto; flex-direction: column; align-items: flex-start; gap: var(--sp-1); padding: var(--sp-2) var(--sp-5); }
+          .status-bar p { white-space: normal; }
           .job-path, .result-row, .file-row, .path-settings { grid-template-columns: 1fr; }
         }
       </style>
@@ -2193,8 +2270,7 @@ def page() -> str:
           <span class="muted app-subtitle">Autor: __APP_AUTHOR__ · App local</span>
           <div hx-get="/partials/update" hx-trigger="load" hx-swap="outerHTML">
             <section id="update-panel" class="update-panel">
-              <span>__APP_VERSION__</span>
-              <small>Revisando actualización...</small>
+              <small>Revisando actualización…</small>
             </section>
           </div>
         </div>

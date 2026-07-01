@@ -1,5 +1,31 @@
 # Notas de actualización
 
+## v1.1.17
+
+- Se corrigió que las descargas en MP3 (y WAV) no se detectaran como ya
+  completadas: el descargador base sólo predecía archivos `.flac`/`.m4a`, por lo
+  que un `.mp3` ya convertido nunca se reconocía. Ahora, con `skip_existing`
+  activo, los tracks ya convertidos aparecen como "Ya existía" y no se vuelven a
+  descargar en cada corrida.
+- La numeración por defecto ya no usa ceros a la izquierda: los nombres pasan de
+  `001`/`01` a `1`, `2`, `3`… incrementándose automáticamente (álbumes por número
+  de track, playlists por índice).
+- La carpeta de descargas por defecto ahora es `~/Music/Tiddl DDJ` (antes
+  `~/Music/tiddl`), más fácil de ubicar.
+- Se rediseñó la interfaz desktop para hacerla más ergonómica: escala
+  tipográfica y de espaciados unificada, cabecera y barra de estado más
+  delgadas (más espacio útil), barra de descarga directa compacta en una fila,
+  y tarjetas de descarga simplificadas (una sola línea de datos en vez de la
+  rejilla de seis campos) para que no se corten en columnas angostas. El tablero
+  de descargas ahora ajusta sus columnas al ancho disponible y las pestañas de
+  biblioteca quedan en rejilla 2×2.
+- Se corrigió que una descarga en curso con un ítem fallido apareciera a la vez
+  en "En curso" y en "Errores": las columnas del tablero ahora son mutuamente
+  excluyentes y un job sólo pasa a "Errores" cuando finaliza.
+- La vista previa ya no muestra el identificador técnico del recurso
+  (`playlist/uuid`, `album/id`) bajo el nombre; ensuciaba el front y no aporta
+  al usuario.
+
 ## v1.1.16
 
 - Los instaladores ahora generan iconos desde el logo oficial y los aplican al

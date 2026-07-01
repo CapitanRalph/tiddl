@@ -13,10 +13,12 @@ from tiddl.web.app import (
     clean_path_segment,
     configure_download_root,
     create_app,
+    download_resource,
     finalize_canceled_job,
     finalize_job,
     format_bytes,
     get_all_web_playlists,
+    output_format_extension,
     page,
     parse_supported_resource,
     render_file_explorer,
@@ -25,6 +27,7 @@ from tiddl.web.app import (
     request_job_cancel,
     save_download_root_config,
     strip_rich,
+    successful_result_count,
     web_playlist_folder,
     web_playlist_item_filename,
 )
@@ -65,7 +68,52 @@ def test_jobs_panel_renders_existing_job():
 
     assert response.status_code == 200
     assert "track/123" in response.text
-    assert "1/2 ítems" in response.text
+    assert "1/2" in response.text
+    assert "ítems" in response.text
+
+
+def test_running_job_with_partial_error_stays_only_in_progress():
+    """A running job that already had one item error must not also appear in
+    the Errores column; columns must be mutually exclusive."""
+    from tiddl.web.app import render_jobs
+
+    state = WebState()
+    job = DownloadJob(
+        id="abc",
+        resource="album/123",
+        status="running",
+        message="Downloading",
+        total=10,
+        completed=3,
+    )
+    job.results.append(JobResult(title="Track 2", path="", status="Error boom"))
+    state.jobs["abc"] = job
+
+    html = render_jobs(state)
+    en_curso = html.index("En curso")
+    completadas = html.index("Completadas")
+    canceladas = html.index("Canceladas")
+    errores = html.index("Errores")
+
+    # the job card must live under "En curso" only (before "Completadas")
+    card = html.index("album/123")
+    assert en_curso < card < completadas
+    # nothing spilled into the later columns
+    assert "album/123" not in html[completadas:]
+    assert html[errores:].count("album/123") == 0
+
+
+def test_finished_job_with_error_moves_to_errors():
+    from tiddl.web.app import render_jobs
+
+    state = WebState()
+    job = DownloadJob(id="abc", resource="album/123", status="done", total=10, completed=9)
+    job.results.append(JobResult(title="Track 2", path="", status="Error boom"))
+    state.jobs["abc"] = job
+
+    html = render_jobs(state)
+    errores = html.index("Errores")
+    assert "album/123" in html[errores:]
 
 
 def test_page_renders_direct_download_full_width():
@@ -168,7 +216,7 @@ def test_job_card_renders_aligned_download_details():
 
     html = render_job(job)
 
-    assert "job-facts" in html
+    assert "job-meta" in html
     assert "job-path" in html
     assert "/tmp/tiddl/playlist/My Playlist" in html
     assert "result-row" in html
@@ -267,7 +315,7 @@ def test_web_playlist_item_filename_is_flat_and_indexed():
         video_quality="fhd",
     )
 
-    assert filename.as_posix() == "007 - Artist - Track"
+    assert filename.as_posix() == "7 - Artist - Track"
 
 
 def test_web_playlist_item_filename_keeps_track_version():
@@ -289,7 +337,82 @@ def test_web_playlist_item_filename_keeps_track_version():
         video_quality="fhd",
     )
 
-    assert filename.as_posix() == "007 - Artist - Track (Extended Mix)"
+    assert filename.as_posix() == "7 - Artist - Track (Extended Mix)"
+
+
+def test_output_format_extension():
+    assert output_format_extension("mp3_320") == ".mp3"
+    assert output_format_extension("wav") == ".wav"
+    assert output_format_extension("raw") is None
+
+
+def test_existing_mp3_is_detected_as_completed(monkeypatch, tmp_path):
+    """Downloading in MP3 must recognise already-converted files on disk.
+
+    The core downloader only predicts .flac/.m4a source names, so without the
+    web-layer check an existing .mp3 was never skipped and completed downloads
+    never showed up. This exercises that skip path end to end.
+    """
+    import asyncio
+
+    monkeypatch.setattr(web_app.CONFIG.download, "download_path", tmp_path)
+    monkeypatch.setattr(web_app.CONFIG.download, "scan_path", tmp_path)
+    monkeypatch.setattr(web_app.CONFIG.download, "skip_existing", True)
+    monkeypatch.setattr(web_app.CONFIG.metadata, "enable", False)
+
+    class ShouldNotDownload(Exception):
+        pass
+
+    class FakeDownloader:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_path(self, base, rel):
+            return base / rel
+
+        async def download(self, item, file_path):
+            raise ShouldNotDownload(item.title)
+
+    monkeypatch.setattr(web_app, "Downloader", FakeDownloader)
+    monkeypatch.setattr(
+        web_app, "get_item_quality", lambda *a, **k: "HIGH"
+    )
+    monkeypatch.setattr(
+        web_app,
+        "format_template",
+        lambda *a, **k: f"Album/{k['item'].trackNumber} - Artist - Track",
+    )
+
+    tracks = [make_track()]
+    # Pre-create the converted .mp3 exactly where the app would write it.
+    mp3 = tmp_path / "Album/1 - Artist - Track.mp3"
+    mp3.parent.mkdir(parents=True, exist_ok=True)
+    mp3.write_bytes(b"fake")
+
+    class FakeAPI:
+        def get_album_items_credits(self, album_id, offset=0):
+            return SimpleNamespace(
+                limit=50,
+                totalNumberOfItems=len(tracks),
+                items=[SimpleNamespace(item=t, credits=[]) for t in tracks],
+            )
+
+        def get_album(self, _):
+            return SimpleNamespace(
+                id=1, title="Album", cover=None, releaseDate=None, artist=None
+            )
+
+    resource = SimpleNamespace(type="album", id=1)
+    job = DownloadJob(id="job", resource="album/1", output_format="mp3_320")
+
+    asyncio.run(
+        download_resource(FakeAPI(), resource, job, "mp3_320", 3, "high", "fhd")
+    )
+
+    assert job.completed == 1
+    assert successful_result_count(job) == 1
+    assert job.results[0].status == "Ya existía"
+    assert job.results[0].path == str(mp3)
 
 
 def test_get_all_web_playlists_paginates_and_deduplicates():
