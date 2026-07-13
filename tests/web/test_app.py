@@ -72,9 +72,9 @@ def test_jobs_panel_renders_existing_job():
     assert "ítems" in response.text
 
 
-def test_running_job_with_partial_error_stays_only_in_progress():
-    """A running job that already had one item error must not also appear in
-    the Errores column; columns must be mutually exclusive."""
+def test_running_job_with_partial_error_stays_in_progress():
+    """A running job that already had one item error must show as active; it
+    only counts as an error once it finishes."""
     from tiddl.web.app import render_jobs
 
     state = WebState()
@@ -90,20 +90,16 @@ def test_running_job_with_partial_error_stays_only_in_progress():
     state.jobs["abc"] = job
 
     html = render_jobs(state)
-    en_curso = html.index("En curso")
-    completadas = html.index("Completadas")
-    canceladas = html.index("Canceladas")
-    errores = html.index("Errores")
 
-    # the job card must live under "En curso" only (before "Completadas")
-    card = html.index("album/123")
-    assert en_curso < card < completadas
-    # nothing spilled into the later columns
-    assert "album/123" not in html[completadas:]
-    assert html[errores:].count("album/123") == 0
+    # exactly one card, badged as running, not counted as error in the summary
+    assert html.count('<article class="job">') == 1
+    assert ">En curso</span>" in html
+    assert "Con errores" not in html
+    assert "1 en curso" in html
+    assert "con errores" not in html
 
 
-def test_finished_job_with_error_moves_to_errors():
+def test_finished_job_with_error_shows_error_badge():
     from tiddl.web.app import render_jobs
 
     state = WebState()
@@ -112,8 +108,36 @@ def test_finished_job_with_error_moves_to_errors():
     state.jobs["abc"] = job
 
     html = render_jobs(state)
-    errores = html.index("Errores")
-    assert "album/123" in html[errores:]
+
+    assert html.count('<article class="job">') == 1
+    assert ">Con errores</span>" in html
+    assert "1 con errores" in html
+
+
+def test_download_forms_inherit_global_settings():
+    from tiddl.web.app import download_form
+
+    full = download_form("album/123", compact=False)
+    compact = download_form("track/1", compact=True)
+
+    # a single settings source: no per-form quality selects
+    assert 'data-global-settings="true"' in full
+    assert "<select" not in full
+    assert "Descargar todo" in full
+    assert 'data-global-settings="true"' in compact
+    assert "<select" not in compact
+    assert "Descargar" in compact
+
+
+def test_file_explorer_success_notice_is_not_styled_as_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("tiddl.web.app.explorer_root", lambda: tmp_path)
+
+    html = render_file_explorer(
+        notice="Ruta de descargas actualizada", notice_kind="success"
+    )
+
+    assert '<p class="notice">Ruta de descargas actualizada</p>' in html
+    assert '<p class="error">Ruta de descargas actualizada</p>' not in html
 
 
 def test_page_renders_direct_download_full_width():
@@ -413,6 +437,98 @@ def test_existing_mp3_is_detected_as_completed(monkeypatch, tmp_path):
     assert successful_result_count(job) == 1
     assert job.results[0].status == "Ya existía"
     assert job.results[0].path == str(mp3)
+
+
+def test_existing_flac_converts_to_requested_mp3(monkeypatch, tmp_path):
+    """If the track already exists as FLAC and the user asks for MP3, the app
+    must convert the local copy (keeping the FLAC) instead of blocking the
+    download with 'Ya existía'."""
+    import asyncio
+
+    monkeypatch.setattr(web_app.CONFIG.download, "download_path", tmp_path)
+    monkeypatch.setattr(web_app.CONFIG.download, "scan_path", tmp_path)
+    monkeypatch.setattr(web_app.CONFIG.download, "skip_existing", True)
+    monkeypatch.setattr(web_app.CONFIG.metadata, "enable", False)
+
+    flac = tmp_path / "Album/1 - Artist - Track.flac"
+    flac.parent.mkdir(parents=True, exist_ok=True)
+    flac.write_bytes(b"fake-flac")
+
+    converted_calls = []
+
+    def fake_convert(source, keep_source=False):
+        converted_calls.append((source, keep_source))
+        target = source.with_suffix(".mp3")
+        target.write_bytes(b"fake-mp3")
+        if not keep_source:
+            source.unlink()
+        return target
+
+    monkeypatch.setattr(web_app, "convert_audio_to_mp3_320", fake_convert)
+
+    class FakeDownloader:
+        def __init__(self, *args, **kwargs):
+            self.rich_output = kwargs["rich_output"]
+
+        def get_path(self, base, rel):
+            return base / rel
+
+        async def download(self, item, file_path):
+            # mimic the core skip_existing behaviour: report Exists, no download
+            self.rich_output.show_item_result(
+                result_message="[yellow]Exists",
+                item_description=item.title,
+                item_path=flac,
+            )
+            return flac, False
+
+    monkeypatch.setattr(web_app, "Downloader", FakeDownloader)
+    monkeypatch.setattr(web_app, "get_item_quality", lambda *a, **k: "HIGH")
+    monkeypatch.setattr(
+        web_app,
+        "format_template",
+        lambda *a, **k: f"Album/{k['item'].trackNumber} - Artist - Track",
+    )
+
+    tracks = [make_track()]
+
+    class FakeAPI:
+        def get_album_items_credits(self, album_id, offset=0):
+            return SimpleNamespace(
+                limit=50,
+                totalNumberOfItems=len(tracks),
+                items=[SimpleNamespace(item=t, credits=[]) for t in tracks],
+            )
+
+        def get_album(self, _):
+            return SimpleNamespace(
+                id=1, title="Album", cover=None, releaseDate=None, artist=None
+            )
+
+    resource = SimpleNamespace(type="album", id=1)
+    job = DownloadJob(id="job", resource="album/1", output_format="mp3_320")
+
+    asyncio.run(
+        download_resource(FakeAPI(), resource, job, "mp3_320", 3, "high", "fhd")
+    )
+
+    assert converted_calls == [(flac, True)]
+    assert flac.exists()
+    assert job.completed == 1
+    assert job.results[-1].status == "Convertido a MP3 320"
+    assert job.results[-1].path == str(flac.with_suffix(".mp3"))
+
+
+def test_playlist_preview_hides_per_track_download():
+    from tiddl.web.app import preview_item_row
+
+    track = make_track()
+
+    with_button = preview_item_row(1, track)
+    without_button = preview_item_row(1, track, show_download=False)
+
+    assert 'hx-post="/jobs"' in with_button
+    assert "hx-post" not in without_button
 
 
 def test_get_all_web_playlists_paginates_and_deduplicates():

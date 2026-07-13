@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiddl"
-version = "1.1.17"
+version = "1.2.0"
 description = "Download Tidal tracks with CLI downloader."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,6 +29,7 @@ dependencies = [
   "requests-cache>=1.2.1",
   "typer>=0.20.0",
   "uvicorn>=0.38.0",
+  "imageio-ffmpeg>=0.5",
 ]
 
 [project.urls]

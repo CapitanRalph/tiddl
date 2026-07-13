@@ -1,5 +1,66 @@
 # Notas de actualización
 
+## v1.2.0
+
+Rediseño UX de la app desktop:
+
+- La calidad de audio/video y el formato ahora se eligen en un solo lugar (la
+  barra "Descarga directa"); todos los botones "Descargar" de vista previa y
+  filas de canciones heredan esos ajustes. Antes cada fila repetía tres
+  selectores (una playlist de 50 canciones mostraba 150 dropdowns).
+- El tablero de descargas dejó de ser un kanban de cuatro columnas fijas (que
+  desperdiciaba el ancho cuando había pocas descargas) y pasó a una lista única
+  de tarjetas: activas primero, luego las más recientes, con chips de resumen
+  (en curso / completadas / canceladas / con errores).
+- Un job terminado con ítems fallidos ahora se distingue con el badge
+  "Con errores"; mientras corre se mantiene como "En curso".
+- Las filas de resultados dentro de cada tarjeta se compactaron: estado con
+  color (verde/ámbar/rojo) y título, con la ruta como tooltip, en vez de ruta
+  completa y botón "Abrir carpeta" por cada archivo.
+- Las pestañas de biblioteca (Playlists/Álbumes/Canciones/Archivos) ahora
+  marcan cuál está activa.
+- Nuevo botón "Vista previa" en la barra de descarga directa para revisar un
+  enlace pegado antes de descargarlo, y el campo acepta explícitamente enlaces
+  completos de TIDAL (el placeholder y los errores lo dicen).
+- Los mensajes de éxito ya no se pintan en rojo (p. ej. al guardar la ruta de
+  descargas) y los errores de red del refresco automático ya no se apilan
+  repetidos en pantalla.
+- Se puede cancelar un intento de inicio de sesión pendiente.
+- La ventana desktop define tamaño mínimo (1000×660) y usa el logo como icono
+  de ventana.
+
+Descargas:
+
+- Descargar una canción que ya existe en otro formato ya no se bloquea con
+  "Ya existía": si el track está en FLAC/M4A y pides MP3 320 o WAV, la app
+  convierte la copia local (sin volver a descargar) y conserva el archivo
+  original. El resultado se muestra como "Convertido a MP3 320" /
+  "Convertido a WAV".
+- En la vista previa de playlists se quitó el botón de descarga por canción:
+  descargar un track suelto lo dejaba fuera de la carpeta de la playlist y sin
+  numeración, lo que parecía un error. Las playlists se descargan completas
+  con "Descargar todo" (la cabecera lo explica).
+- El botón "Descargar" de la barra directa queda inactivo mientras no haya un
+  enlace pegado, y el campo se limpia al iniciar la descarga, evitando
+  descargas duplicadas o clics confusos mientras baja una playlist.
+
+Empaquetado portable:
+
+- **FFmpeg ahora viene incluido**: la app usa el binario estático de
+  `imageio-ffmpeg` (macOS arm64/x64, Windows x64 y Linux), tanto en la
+  instalación con `uv`/pip como dentro del `.dmg` y el `.exe` portable. Ya no
+  hay que instalar ffmpeg aparte; `TIDDL_FFMPEG` permite apuntar a un binario
+  propio. La detección de códec dejó de depender de `ffprobe` (que el binario
+  embebido no trae) y ahora usa el propio `ffmpeg`.
+- Windows ahora se publica como ejecutable portable único
+  (`Tiddl-DDJ-vX.Y.Z-Windows-x64-Portable.exe`): sin instalador, se ejecuta
+  desde cualquier carpeta. Los scripts de Inno Setup siguen en el repo para
+  quien prefiera un instalador.
+- El `.dmg` de macOS (arm64 y x64) se mantiene; la app se puede arrastrar a
+  Applications o ejecutarse directamente.
+- El mensaje del botón de actualización refleja el flujo portable: se descarga
+  y abre la nueva versión, y basta cerrar la anterior.
+
 ## v1.1.17
 
 - Se corrigió que las descargas en MP3 (y WAV) no se detectaran como ya

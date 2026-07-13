@@ -164,5 +164,4 @@ cython_debug/
 # Ruff
 .ruff_cache
 
-# UV
-uv.lock
+# UV: uv.lock se versiona para que `uv sync --locked` funcione en CI

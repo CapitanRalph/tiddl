@@ -216,10 +216,17 @@ class WebOutput:
         )
 
     def update_last_result_path(self, path: Path) -> None:
+        self.update_last_result(path)
+
+    def update_last_result(self, path: Path, status: str = "") -> None:
         if not self.job.results:
             return
 
         self.job.results[-1].path = str(path)
+        if status:
+            self.job.results[-1].status = status
+            self.job.terminal.append(f"{status} {self.job.results[-1].title}")
+            self.job.terminal = self.job.terminal[-40:]
 
     def show_item_error(self, item: Track | Video, error: Exception) -> None:
         message = f"{item.title}: {error}"
@@ -317,6 +324,12 @@ def create_app(state: WebState | None = None) -> FastAPI:
             web_state.login_attempt = None
         return render_session_panel(web_state)
 
+    @app.post("/auth/cancel", response_class=HTMLResponse)
+    def auth_cancel() -> str:
+        with web_state.lock:
+            web_state.login_attempt = None
+        return render_session_panel(web_state)
+
     @app.get("/auth/status", response_class=HTMLResponse)
     def auth_status() -> str:
         attempt = web_state.login_attempt
@@ -351,7 +364,8 @@ def create_app(state: WebState | None = None) -> FastAPI:
 
         if installer:
             return render_update_message(
-                f"Instalador abierto: {installer.name}. Cierra {APP_NAME} cuando termine."
+                f"Actualización abierta: {installer.name}. "
+                f"Cierra esta versión de {APP_NAME} y usa la nueva."
             )
 
         return render_update_panel(info)
@@ -386,6 +400,7 @@ def create_app(state: WebState | None = None) -> FastAPI:
 
         return render_file_explorer(
             notice=f"Ruta de descargas actualizada: {root}",
+            notice_kind="success",
         )
 
     @app.get("/partials/preview", response_class=HTMLResponse)
@@ -557,13 +572,14 @@ def ensure_fresh_auth(auth_api: AuthAPI, force: bool = False) -> AuthData:
 
 def parse_supported_resource(resource: str) -> TidalResource:
     if not resource.strip():
-        raise ValueError("Ingresa un recurso para descargar.")
+        raise ValueError("Pega un enlace de TIDAL o un recurso para descargar.")
 
     try:
         tidal_resource = TidalResource.from_string(resource)
     except ValueError as exc:
         raise ValueError(
-            "Ingresa un recurso válido: track/123, album/123 o playlist/uuid."
+            "Pega un enlace de TIDAL o un recurso válido: "
+            "track/123, album/123 o playlist/uuid."
         ) from exc
 
     if tidal_resource.type not in ("track", "album", "playlist"):
@@ -950,10 +966,20 @@ async def download_resource(
         if not was_downloaded and job.completed == completed_before:
             output.mark_item_processed()
 
-        if isinstance(item, Track) and was_downloaded:
+        if isinstance(item, Track):
             try:
-                path = convert_track_output(path, output_format)
-                output.update_last_result_path(path)
+                if was_downloaded:
+                    path = convert_track_output(path, output_format)
+                    output.update_last_result_path(path)
+                elif converted_ext is not None and path.suffix != converted_ext:
+                    # The track exists on disk in another format (e.g. FLAC
+                    # kept as RAW) and the user asked for MP3/WAV: convert the
+                    # local copy instead of reporting "already exists", and
+                    # keep the original file untouched.
+                    path = convert_track_output(path, output_format, keep_source=True)
+                    output.update_last_result(
+                        path, status=converted_status_label(output_format)
+                    )
             except Exception as exc:
                 if job.completed == completed_before:
                     output.mark_item_processed()
@@ -1194,14 +1220,20 @@ def output_format_extension(output_format: AudioOutputFormat) -> str | None:
             return None
 
 
-def convert_track_output(path: Path, output_format: AudioOutputFormat) -> Path:
+def convert_track_output(
+    path: Path, output_format: AudioOutputFormat, keep_source: bool = False
+) -> Path:
     match output_format:
         case "raw":
             return path
         case "wav":
-            return convert_audio_to_wav(path)
+            return convert_audio_to_wav(path, keep_source=keep_source)
         case "mp3_320":
-            return convert_audio_to_mp3_320(path)
+            return convert_audio_to_mp3_320(path, keep_source=keep_source)
+
+
+def converted_status_label(output_format: AudioOutputFormat) -> str:
+    return "Convertido a WAV" if output_format == "wav" else "Convertido a MP3 320"
 
 
 def render_library(api: TidalAPI, kind: ResourceKind) -> str:
@@ -1257,7 +1289,11 @@ def render_library(api: TidalAPI, kind: ResourceKind) -> str:
     """
 
 
-def render_file_explorer(path: str = "", notice: str = "") -> str:
+def render_file_explorer(
+    path: str = "",
+    notice: str = "",
+    notice_kind: Literal["error", "success"] = "error",
+) -> str:
     root = explorer_root()
     current, relative = resolve_explorer_path(path)
     root.mkdir(parents=True, exist_ok=True)
@@ -1304,7 +1340,13 @@ def render_file_explorer(path: str = "", notice: str = "") -> str:
         <button hx-get="/partials/files?path={quote(parent_path)}" hx-target="#library" hx-swap="innerHTML">Subir</button>
         """
 
-    notice_html = render_inline_error(notice) if notice else ""
+    if not notice:
+        notice_html = ""
+    elif notice_kind == "success":
+        notice_html = render_inline_notice(notice)
+    else:
+        notice_html = render_inline_error(notice)
+
     error_html = render_inline_error(access_error) if access_error else ""
 
     return f"""
@@ -1396,12 +1438,18 @@ def render_preview(api: TidalAPI, resource: TidalResource) -> str:
         case "playlist":
             playlist = api.get_playlist(resource.id)
             items = api.get_playlist_items(resource.id, limit=50)
+            # No per-track download buttons here: a single track downloaded on
+            # its own skips the playlist folder and numbering, which reads as
+            # a bug. Playlists download complete via "Descargar todo".
             rows = [
-                preview_item_row(index + 1, item.item)
+                preview_item_row(index + 1, item.item, show_download=False)
                 for index, item in enumerate(items.items)
             ]
             title = playlist.title
-            meta = f"{playlist.numberOfTracks} canciones · {playlist.numberOfVideos} videos"
+            meta = (
+                f"{playlist.numberOfTracks} canciones · {playlist.numberOfVideos} videos"
+                " · se descarga completa para conservar orden y carpeta"
+            )
 
         case "album":
             album = api.get_album(resource.id)
@@ -1476,6 +1524,7 @@ def render_login_attempt(attempt: LoginAttempt) -> str:
         <p class="muted">{escape(attempt.message)}</p>
         <a class="link" href="{escape(attempt.uri)}" target="_blank">Abrir autorización de TIDAL</a>
       </div>
+      <button class="ghost" hx-post="/auth/cancel" hx-target="#session-panel" hx-swap="outerHTML" title="Detener este intento de inicio de sesión">Cancelar</button>
     </section>
     """
 
@@ -1496,6 +1545,10 @@ def render_inline_error(message: str) -> str:
     return f'<p class="error">{escape(message)}</p>'
 
 
+def render_inline_notice(message: str) -> str:
+    return f'<p class="notice">{escape(message)}</p>'
+
+
 def render_preview_message(title: str, message: str) -> str:
     return f"""
     <section class="preview-card">
@@ -1511,49 +1564,56 @@ def render_preview_message(title: str, message: str) -> str:
 
 def render_jobs(state: WebState, notice: str = "") -> str:
     jobs = sorted(state.jobs.values(), key=lambda item: item.created_at, reverse=True)
-    if not jobs:
-        notice_html = (
-            render_job_notice(notice) if notice else '<p class="muted">Sin errores.</p>'
-        )
-        return """
-        <section id="jobs" class="job-board">
-          <div class="job-column"><h3>En curso</h3><p class="muted">Sin descargas activas.</p></div>
-          <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
-          <div class="job-column"><h3>Canceladas</h3><p class="muted">Sin cancelaciones.</p></div>
-          <div class="job-column"><h3>Errores</h3>__NOTICE__</div>
-        </section>
-        """.replace("__NOTICE__", notice_html)
+    notice_html = render_job_notice(notice) if notice else ""
 
-    # Columns are mutually exclusive: an active job (queued/running/canceling)
-    # stays only in "En curso" even if a single item already errored. It moves
-    # to "Errores" only once it finishes (status failed, or done with errors).
+    if not jobs:
+        return f"""
+        <section id="jobs" class="job-board">
+          {notice_html}
+          <p class="muted empty-state">Sin descargas activas. Pega un enlace de TIDAL arriba o elige un elemento de tu biblioteca.</p>
+        </section>
+        """
+
+    # A single chronological list: active jobs first, then the most recent
+    # finished ones. A job appears exactly once; while active it stays "En
+    # curso" even if some item already errored, and only counts as error once
+    # it finishes (status failed, or done with item errors).
     active_states = ("queued", "running", "canceling")
-    queued = [job for job in jobs if job.status in active_states]
-    done = [job for job in jobs if job.status == "done" and not has_job_errors(job)]
-    canceled = [job for job in jobs if job.status == "canceled"]
+    active = [job for job in jobs if job.status in active_states]
+    finished = [job for job in jobs if job.status not in active_states]
+    done = [
+        job for job in finished if job.status == "done" and not has_job_errors(job)
+    ]
+    canceled = [job for job in finished if job.status == "canceled"]
     failed = [
         job
-        for job in jobs
+        for job in finished
         if job.status == "failed" or (job.status == "done" and has_job_errors(job))
     ]
+
+    cards = "".join(render_job(job) for job in (active + finished)[:24])
     return f"""
     <section id="jobs" class="job-board">
-      {render_job_column("En curso", queued)}
-      {render_job_column("Completadas", done)}
-      {render_job_column("Canceladas", canceled)}
-      {render_job_column("Errores", failed, render_job_notice(notice) if notice else "")}
+      {render_job_summary(len(active), len(done), len(canceled), len(failed))}
+      {notice_html}
+      <div class="job-grid">{cards}</div>
     </section>
     """
 
 
-def render_job_column(title: str, jobs: list[DownloadJob], extra: str = "") -> str:
-    if not jobs and not extra:
-        return f'<div class="job-column"><h3>{escape(title)}</h3><p class="muted">Sin registros.</p></div>'
-
-    rows = [render_job(job) for job in jobs[:12]]
-    return (
-        f'<div class="job-column"><h3>{escape(title)}</h3>{"".join(rows)}{extra}</div>'
+def render_job_summary(active: int, done: int, canceled: int, failed: int) -> str:
+    chips = [
+        (active, "running", "en curso", "en curso"),
+        (done, "done", "completada", "completadas"),
+        (canceled, "canceled", "cancelada", "canceladas"),
+        (failed, "failed", "con errores", "con errores"),
+    ]
+    items = "".join(
+        f'<span class="chip {kind}">{count} {singular if count == 1 else plural}</span>'
+        for count, kind, singular, plural in chips
+        if count
     )
+    return f'<div class="job-summary">{items}</div>'
 
 
 def render_job_notice(message: str) -> str:
@@ -1624,6 +1684,7 @@ def render_job(job: DownloadJob) -> str:
         if job.display_name and job.display_name != job.resource
         else ""
     )
+    badge_class, badge_label = job_badge(job)
     return f"""
     <article class="job">
       <div class="job-top">
@@ -1633,7 +1694,7 @@ def render_job(job: DownloadJob) -> str:
           <p class="muted">{escape(job.message)}</p>
         </div>
         <div class="job-actions">
-          <span class="badge {escape(job.status)}">{escape(job_status_label(job.status))}</span>
+          <span class="badge {escape(badge_class)}">{escape(badge_label)}</span>
           {cancel_job_form(job)}
         </div>
       </div>
@@ -1656,22 +1717,25 @@ def render_job(job: DownloadJob) -> str:
     """
 
 
-def render_job_result(result: JobResult) -> str:
-    open_button = ""
-    if result.path:
-        open_button = f"""
-        <form hx-post="/open-folder" hx-target="#status-bar" hx-swap="outerHTML">
-          <input type="hidden" name="path" value="{escape(result.path)}">
-          <button>Abrir carpeta</button>
-        </form>
-        """
+def job_badge(job: DownloadJob) -> tuple[str, str]:
+    if job.status == "done" and has_job_errors(job):
+        return "failed", "Con errores"
 
+    return job.status, job_status_label(job.status)
+
+
+def render_job_result(result: JobResult) -> str:
+    status_class = "result-status"
+    if is_error_status(result.status):
+        status_class += " error-status"
+    elif is_skipped_status(result.status):
+        status_class += " warn-status"
+
+    tooltip = result.path or "Sin archivo"
     return f"""
     <div class="result-row">
-      <span class="result-status">{escape(result.status)}</span>
-      <strong title="{escape(result.title)}">{escape(result.title)}</strong>
-      <code title="{escape(result.path or "Sin archivo")}">{escape(result.path or "Sin archivo")}</code>
-      {open_button}
+      <span class="{status_class}" title="{escape(result.status)}">{escape(result.status)}</span>
+      <strong title="{escape(tooltip)}">{escape(result.title)}</strong>
     </div>
     """
 
@@ -1699,7 +1763,9 @@ def resource_row(kind: str, title: str, meta: str, resource: str) -> str:
     """
 
 
-def preview_item_row(index: int, item: Track | Video) -> str:
+def preview_item_row(
+    index: int, item: Track | Video, show_download: bool = True
+) -> str:
     artist = item.artist.name if item.artist else ""
     if isinstance(item, Track):
         detail = f"{artist} · canción {item.trackNumber} · {item.audioQuality}"
@@ -1708,6 +1774,10 @@ def preview_item_row(index: int, item: Track | Video) -> str:
         detail = f"{artist} · video · {item.quality}"
         resource = f"video/{item.id}"
 
+    action = ""
+    if show_download and isinstance(item, Track):
+        action = download_form(resource, compact=True)
+
     return f"""
     <article class="track-row">
       <span>{index:02d}</span>
@@ -1715,37 +1785,34 @@ def preview_item_row(index: int, item: Track | Video) -> str:
         <strong>{escape(item.title)}</strong>
         <p class="muted">{escape(detail)}</p>
       </div>
-      {download_form(resource, compact=True) if isinstance(item, Track) else ""}
+      {action}
     </article>
     """
 
 
 def download_form(resource: str, compact: bool) -> str:
-    compact_class = "compact-form" if compact else "download-form"
+    # Quality and format live only in the top "Descarga directa" bar; these
+    # forms inherit them at submit time (data-global-settings, see page JS) so
+    # the UI keeps a single source of truth instead of repeating three selects
+    # on every row.
+    hint = "Usa la calidad y el formato elegidos en la barra superior"
+    if compact:
+        return f"""
+        <form class="compact-form" data-global-settings="true" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
+          <input type="hidden" name="resource" value="{escape(resource)}">
+          <button class="ghost" title="{hint}">Descargar</button>
+        </form>
+        """
+
+    label = (
+        "Descargar todo"
+        if resource.startswith(("album/", "playlist/"))
+        else "Descargar"
+    )
     return f"""
-    <form class="{compact_class}" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
+    <form class="download-form" data-global-settings="true" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
       <input type="hidden" name="resource" value="{escape(resource)}">
-      <label>
-        <span>Calidad audio</span>
-        <select name="track_quality">
-          {quality_options(CONFIG.download.track_quality)}
-        </select>
-      </label>
-      <label>
-        <span>Calidad video</span>
-        <select name="video_quality">
-          {video_quality_options(CONFIG.download.video_quality)}
-        </select>
-      </label>
-      <label>
-        <span>Formato</span>
-        <select name="output_format">
-          <option value="raw">RAW</option>
-          <option value="wav">WAV</option>
-          <option value="mp3_320">MP3 320</option>
-        </select>
-      </label>
-      <button class="primary">Iniciar descarga</button>
+      <button class="primary" title="{hint}">{label}</button>
     </form>
     """
 
@@ -1984,8 +2051,9 @@ def page() -> str:
               swapHtml(target, html, swapMode);
             } catch (error) {
               const message = escapeHtml(error.message || error);
-              const html = `<p class="error">No se pudo completar la solicitud. ${message}</p>`;
+              const html = `<p class="error hx-error">No se pudo completar la solicitud. ${message}</p>`;
               if (target) {
+                target.querySelectorAll(".hx-error").forEach((node) => node.remove());
                 target.insertAdjacentHTML("afterbegin", html);
               }
             } finally {
@@ -2021,6 +2089,20 @@ def page() -> str:
               initTrigger(root);
             }
             root.querySelectorAll?.("[hx-trigger]").forEach(initTrigger);
+          };
+
+          const initDirectBar = () => {
+            const form = document.getElementById("direct-download-form");
+            if (!form) return;
+            const input = form.elements.resource;
+            if (!input) return;
+            const buttons = form.querySelectorAll("button");
+            const sync = () => {
+              const empty = !input.value.trim();
+              buttons.forEach((button) => { button.disabled = empty; });
+            };
+            input.addEventListener("input", sync);
+            sync();
           };
 
           const initPaneResizer = () => {
@@ -2063,10 +2145,51 @@ def page() -> str:
             const form = event.target.closest("form[hx-post]");
             if (!form) return;
             event.preventDefault();
-            request(form, "POST", form.getAttribute("hx-post"), new FormData(form));
+            const body = new FormData(form);
+            if (form.dataset.globalSettings === "true") {
+              const settings = document.getElementById("direct-download-form");
+              if (settings) {
+                ["track_quality", "video_quality", "output_format"].forEach((name) => {
+                  const field = settings.elements[name];
+                  if (field && !body.has(name)) {
+                    body.set(name, field.value);
+                  }
+                });
+              }
+            }
+            request(form, "POST", form.getAttribute("hx-post"), body).then(() => {
+              if (form.id === "direct-download-form") {
+                const input = form.elements.resource;
+                if (input) {
+                  input.value = "";
+                  input.dispatchEvent(new Event("input"));
+                }
+              }
+            });
           });
 
           document.addEventListener("click", (event) => {
+            const previewButton = event.target.closest('[data-action="preview"]');
+            if (previewButton) {
+              event.preventDefault();
+              const form = previewButton.closest("form");
+              const input = form ? form.elements.resource : null;
+              const value = input ? input.value.trim() : "";
+              if (!value) {
+                if (input) input.focus();
+                return;
+              }
+              request(previewButton, "GET", `/partials/preview?resource=${encodeURIComponent(value)}`);
+              return;
+            }
+
+            const tab = event.target.closest(".tabs button");
+            if (tab) {
+              tab.closest(".tabs").querySelectorAll("button").forEach((button) => {
+                button.setAttribute("aria-pressed", button === tab ? "true" : "false");
+              });
+            }
+
             const el = event.target.closest("[hx-get], [hx-post]");
             if (!el || el.closest("form")) return;
             event.preventDefault();
@@ -2079,6 +2202,7 @@ def page() -> str:
 
           document.addEventListener("DOMContentLoaded", () => {
             bind(document);
+            initDirectBar();
             initPaneResizer();
           });
         })();
@@ -2124,8 +2248,9 @@ def page() -> str:
         .direct-bar { padding: var(--sp-2) var(--sp-5); border-bottom: 1px solid var(--line); background: var(--surface); box-shadow: 0 6px 18px rgba(24, 35, 45, .03); z-index: 1; }
         .manual-download { display: flex; align-items: end; gap: var(--sp-3); width: 100%; flex-wrap: wrap; }
         .manual-download h2 { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; align-self: center; }
-        .manual-download .settings { display: grid; grid-template-columns: minmax(260px, 1fr) 150px 130px 130px auto; gap: var(--sp-2); align-items: end; flex: 1; min-width: 0; }
+        .manual-download .settings { display: grid; grid-template-columns: minmax(240px, 1fr) 205px 125px 110px auto; gap: var(--sp-2); align-items: end; flex: 1; min-width: 0; }
         .manual-download label { display: grid; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); }
+        .direct-actions { display: flex; gap: var(--sp-2); align-items: end; }
 
         /* ---- Main working area ---- */
         main { display: grid; grid-template-columns: minmax(260px, 320px) minmax(520px, 1fr); min-height: 0; overflow: hidden; }
@@ -2150,8 +2275,11 @@ def page() -> str:
         .actions, .tabs, form.inline { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
         button, input, select { min-height: var(--control-h); border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); padding: 0 11px; font: inherit; font-size: var(--fs-base); }
         input { min-width: 0; width: 100%; }
-        button { cursor: pointer; font-weight: 600; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+        button { cursor: pointer; font-weight: 600; transition: background .16s ease, border-color .16s ease, color .16s ease, opacity .16s ease; }
         button:hover { border-color: #aab6bf; background: #f6f8fa; }
+        button:disabled { opacity: .45; cursor: not-allowed; }
+        button:disabled:hover { border-color: var(--line); background: var(--surface); }
+        button.primary:disabled:hover { background: var(--accent); border-color: var(--accent); }
         [aria-busy="true"] { cursor: progress; opacity: .72; }
         button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
         button.primary { background: var(--accent); color: white; border-color: var(--accent); }
@@ -2161,6 +2289,7 @@ def page() -> str:
         button.danger:hover { background: var(--danger-bg); border-color: #e9aaaa; }
         .tabs { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--sp-2); margin: var(--sp-2) 0 var(--sp-1); }
         .tabs button { min-width: 0; background: #f9fbfd; }
+        .tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 
         /* ---- Library / file lists ---- */
         .library-list, .file-list { display: grid; gap: 1px; margin-top: var(--sp-2); }
@@ -2194,12 +2323,17 @@ def page() -> str:
         .download-form label, .compact-form label { display: grid; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); }
         .compact-form select { width: 110px; }
 
-        /* ---- Job board (kanban) ---- */
-        .job-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-2); align-items: start; }
-        .job-column { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--sp-2) var(--sp-3); background: var(--surface); box-shadow: var(--shadow); }
-        .job-column > h3 { position: sticky; top: 0; }
-        .job { padding: var(--sp-2) 0; }
-        .job + .job { border-top: 1px solid var(--soft-line); }
+        /* ---- Job board (unified list) ---- */
+        .job-board { display: grid; gap: var(--sp-2); align-content: start; }
+        .job-summary { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+        .chip { font-size: var(--fs-xs); font-weight: 700; border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; background: var(--surface); color: var(--muted); }
+        .chip.running { color: var(--warn); border-color: #e5c37b; background: #fff8ea; }
+        .chip.done { color: var(--accent); border-color: #9fd4c9; background: #eefaf7; }
+        .chip.failed { color: var(--danger); border-color: #e9aaaa; background: var(--danger-bg); }
+        .chip.canceled { color: #607184; border-color: #aebac5; }
+        .job-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: var(--sp-3); align-items: start; }
+        .empty-state { padding: var(--sp-4) 0; }
+        .job { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--sp-3); background: var(--surface); box-shadow: var(--shadow); }
         .job-top { display: flex; justify-content: space-between; gap: var(--sp-2); align-items: flex-start; }
         .job-top > div { min-width: 0; }
         .job-top strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2221,13 +2355,15 @@ def page() -> str:
         .job-path code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .job-path form, .result-row form { margin: 0; }
         .job-path button, .result-row button { min-height: 28px; font-size: var(--fs-xs); padding: 0 8px; white-space: nowrap; }
-        .result-list { display: grid; gap: var(--sp-2); margin-top: var(--sp-2); }
-        .result-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 2px var(--sp-2); align-items: center; padding-bottom: var(--sp-2); border-bottom: 1px solid #eef1f3; }
-        .result-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .result-row code { grid-column: 1 / -1; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .result-status { color: var(--accent); font-size: var(--fs-xs); font-weight: 600; }
+        .result-list { display: grid; gap: var(--sp-1); margin-top: var(--sp-2); }
+        .result-row { display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); gap: var(--sp-2); align-items: baseline; padding-bottom: var(--sp-1); border-bottom: 1px solid #eef1f3; }
+        .result-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+        .result-status { color: var(--accent); font-size: var(--fs-xs); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .result-status.warn-status { color: var(--warn); }
+        .result-status.error-status { color: var(--danger); }
         code { font-size: var(--fs-xs); word-break: break-all; }
         .error { color: var(--danger); font-size: var(--fs-sm); margin: var(--sp-2) 0 0; }
+        .notice { color: #0c5c4e; background: #eefaf7; border: 1px solid #bfe5dc; border-radius: var(--radius-sm); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-sm); margin: 0; }
 
         /* ---- Status bar (slim, single line) ---- */
         .status-bar { height: 40px; display: flex; align-items: center; gap: var(--sp-5); padding: 0 var(--sp-5); border-top: 1px solid var(--dark-line); background: var(--dark); color: #e1e7ea; font-size: var(--fs-sm); overflow: hidden; }
@@ -2252,7 +2388,8 @@ def page() -> str:
           .download-form select, .compact-form select { width: 100%; }
           .track-row { grid-template-columns: 26px 1fr; }
           .track-row form { grid-column: 1 / -1; }
-          .job-board { grid-template-columns: 1fr; }
+          .job-grid { grid-template-columns: 1fr; }
+          .direct-actions { flex-direction: column; align-items: stretch; }
           .status-bar { height: auto; flex-direction: column; align-items: flex-start; gap: var(--sp-1); padding: var(--sp-2) var(--sp-5); }
           .status-bar p { white-space: normal; }
           .job-path, .result-row, .file-row, .path-settings { grid-template-columns: 1fr; }
@@ -2276,34 +2413,37 @@ def page() -> str:
         </div>
       </header>
       <section class="direct-bar">
-        <form class="manual-download" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
+        <form class="manual-download" id="direct-download-form" hx-post="/jobs" hx-target="#jobs" hx-swap="outerHTML">
           <h2>Descarga directa</h2>
           <div class="settings">
             <label>
-              <span>Recurso</span>
-              <input name="resource" placeholder="track/123, album/123 o playlist/uuid">
+              <span>Enlace o recurso de TIDAL</span>
+              <input name="resource" placeholder="Pega un enlace de TIDAL o track/123, album/123, playlist/uuid">
             </label>
             <label>
               <span>Calidad audio</span>
-              <select name="track_quality" title="Calidad de streaming de audio">
+              <select name="track_quality" title="Calidad de streaming de audio. Se aplica a todas las descargas.">
                 __TRACK_QUALITY_OPTIONS__
               </select>
             </label>
             <label>
               <span>Calidad video</span>
-              <select name="video_quality" title="Calidad de streaming de video">
+              <select name="video_quality" title="Calidad de streaming de video. Se aplica a todas las descargas.">
                 __VIDEO_QUALITY_OPTIONS__
               </select>
             </label>
             <label>
               <span>Formato</span>
-              <select name="output_format">
+              <select name="output_format" title="Formato final del audio. Se aplica a todas las descargas.">
                 <option value="raw">RAW</option>
                 <option value="wav">WAV</option>
                 <option value="mp3_320">MP3 320</option>
               </select>
             </label>
-            <button class="primary">Iniciar descarga</button>
+            <div class="direct-actions">
+              <button type="button" data-action="preview" hx-target="#preview" hx-swap="innerHTML" title="Revisar el contenido antes de descargar">Vista previa</button>
+              <button class="primary">Descargar</button>
+            </div>
           </div>
         </form>
       </section>
@@ -2313,10 +2453,10 @@ def page() -> str:
           <section>
             <h2>Biblioteca</h2>
             <div class="tabs">
-              <button hx-get="/partials/library?kind=playlist" hx-target="#library">Playlists</button>
-              <button hx-get="/partials/library?kind=album" hx-target="#library">Álbumes</button>
-              <button hx-get="/partials/library?kind=track" hx-target="#library">Canciones</button>
-              <button hx-get="/partials/files" hx-target="#library">Archivos</button>
+              <button aria-pressed="true" hx-get="/partials/library?kind=playlist" hx-target="#library">Playlists</button>
+              <button aria-pressed="false" hx-get="/partials/library?kind=album" hx-target="#library">Álbumes</button>
+              <button aria-pressed="false" hx-get="/partials/library?kind=track" hx-target="#library">Canciones</button>
+              <button aria-pressed="false" hx-get="/partials/files" hx-target="#library">Archivos</button>
             </div>
             <div id="library" hx-get="/partials/library?kind=playlist" hx-trigger="load">
               <p class="muted">Cargando biblioteca...</p>
@@ -2341,10 +2481,7 @@ def page() -> str:
             <h2>Descargas</h2>
             <div hx-get="/partials/jobs" hx-trigger="load, every 2s" hx-target="#jobs" hx-swap="outerHTML">
               <section id="jobs" class="job-board">
-                <div class="job-column"><h3>En curso</h3><p class="muted">Sin descargas activas.</p></div>
-                <div class="job-column"><h3>Completadas</h3><p class="muted">Sin descargas completas.</p></div>
-                <div class="job-column"><h3>Canceladas</h3><p class="muted">Sin cancelaciones.</p></div>
-                <div class="job-column"><h3>Errores</h3><p class="muted">Sin errores.</p></div>
+                <p class="muted empty-state">Sin descargas activas. Pega un enlace de TIDAL arriba o elige un elemento de tu biblioteca.</p>
               </section>
             </div>
           </section>
@@ -2354,7 +2491,7 @@ def page() -> str:
         <section id="status-bar" class="status-bar">
           <div><strong>Terminal</strong><p>Sin actividad</p></div>
           <div><strong>Descarga actual</strong><p>Ninguna</p></div>
-          <div><strong>Progreso</strong><p>0 activas · 0 en cola · 0 cancelando · 0 completas · 0 canceladas · 0 errores</p></div>
+          <div><strong>Progreso</strong><p>0 activas · 0 en cola · 0 completas · 0 canceladas · 0 errores</p></div>
         </section>
       </div>
     </body>
@@ -2450,8 +2587,10 @@ def run_desktop(
             f"http://{host}:{port}",
             width=1240,
             height=820,
+            min_size=(1000, 660),
         )
-        webview.start(gui="qt")
+        icon = WEB_ASSETS_PATH / "tiddl-ddj-logo.png"
+        webview.start(gui="qt", icon=str(icon) if icon.exists() else None)
     except Exception as exc:
         server.should_exit = True
         raise RuntimeError(

@@ -27,14 +27,16 @@ https://github.com/CapitanRalph/tiddl
 > probar este proyecto tal como está documentado aquí, instala desde GitHub.
 
 > [!IMPORTANT]
-> Asegúrate también de tener instalado [`ffmpeg`](https://ffmpeg.org/download.html).
-> Se usa para convertir los tracks descargados al formato correcto.
+> `ffmpeg` ya viene incluido: la app usa el binario estático de
+> [`imageio-ffmpeg`](https://pypi.org/project/imageio-ffmpeg/) para convertir
+> los tracks al formato correcto, tanto en la instalación con `uv`/pip como en
+> los paquetes `.dmg`/`.exe`. Si prefieres usar tu propio ffmpeg, define la
+> variable de entorno `TIDDL_FFMPEG` con la ruta al ejecutable.
 
 ## Requisitos
 
 - Python 3.12 o superior.
 - `git`.
-- `ffmpeg`.
 - `uv`, recomendado para instalar y ejecutar el proyecto.
 - En Linux, algunas dependencias de WebKit/GTK o Qt pueden ser necesarias para
   abrir la ventana nativa de `tiddl desktop`. Si no quieres instalar esas
@@ -48,7 +50,7 @@ Instala dependencias del sistema:
 
 ```bash
 sudo apt update
-sudo apt install -y git curl python3.12 python3.12-venv ffmpeg
+sudo apt install -y git curl python3.12 python3.12-venv
 ```
 
 Instala `uv`:
@@ -85,7 +87,7 @@ tiddl desktop --browser
 ### Fedora
 
 ```bash
-sudo dnf install -y git curl python3.12 ffmpeg
+sudo dnf install -y git curl python3.12
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv tool install "git+https://github.com/CapitanRalph/tiddl.git"
@@ -96,7 +98,7 @@ tiddl --version
 ### Arch Linux
 
 ```bash
-sudo pacman -Syu --needed git curl python ffmpeg
+sudo pacman -Syu --needed git curl python
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv tool install "git+https://github.com/CapitanRalph/tiddl.git"
@@ -110,7 +112,7 @@ Instala [Homebrew](https://brew.sh/) si aún no lo tienes. Luego instala las
 dependencias:
 
 ```bash
-brew install git python@3.12 ffmpeg uv
+brew install git python@3.12 uv
 ```
 
 Instala `tiddl` desde el fork:
@@ -141,12 +143,11 @@ Abre PowerShell como usuario normal e instala `uv`:
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Instala Python 3.12, Git y FFmpeg. Si usas `winget`:
+Instala Python 3.12 y Git. Si usas `winget`:
 
 ```powershell
 winget install Python.Python.3.12
 winget install Git.Git
-winget install Gyan.FFmpeg
 ```
 
 Cierra y vuelve a abrir PowerShell para actualizar el `PATH`. Luego instala el
@@ -194,9 +195,10 @@ tiddl desktop
 ```
 
 > [!NOTE]
-> Si instalaste con los instaladores `.dmg`/`.exe`, actualiza desde el propio
-> botón de actualización dentro de la app desktop o descarga el instalador más
-> reciente desde GitHub Releases.
+> Si usas la app empaquetada (`.dmg` de macOS o el `.exe` portable de Windows),
+> actualiza desde el propio botón de actualización dentro de la app desktop o
+> descarga la versión más reciente desde GitHub Releases. El `.exe` portable no
+> requiere instalación: basta reemplazar el archivo anterior por el nuevo.
 
 ## Instalación para desarrollo
 

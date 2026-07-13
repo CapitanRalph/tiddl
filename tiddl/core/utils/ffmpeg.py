@@ -1,9 +1,31 @@
+import os
+import re
 import subprocess
 from pathlib import Path
 
 
 class FFmpegError(RuntimeError):
     pass
+
+
+def ffmpeg_exe() -> str:
+    """Path to the ffmpeg executable.
+
+    Resolution order: `TIDDL_FFMPEG` env override, the static binary bundled
+    with `imageio-ffmpeg` (shipped inside the packaged apps), then plain
+    `ffmpeg` from PATH.
+    """
+
+    env = os.environ.get("TIDDL_FFMPEG")
+    if env:
+        return env
+
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        return get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -22,53 +44,53 @@ def run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 def is_ffmpeg_installed() -> bool:
-    """Checks if `ffmpeg` is installed."""
+    """Checks if `ffmpeg` is available (bundled or on PATH)."""
 
     try:
-        run(["ffmpeg", "-version"])
+        run([ffmpeg_exe(), "-version"])
         return True
     except (FileNotFoundError, FFmpegError):
         return False
 
 
 def _probe_audio_codec(source: Path) -> str:
-    """Return first audio stream's codec_name, or "" if ffprobe is unavailable."""
+    """Return the first audio stream's codec name, or "" if unknown.
+
+    Parses `ffmpeg -i` stream info instead of using ffprobe: the bundled
+    imageio-ffmpeg binary ships without ffprobe.
+    """
+
     try:
-        r = run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(source),
-            ]
+        r = subprocess.run(
+            [ffmpeg_exe(), "-hide_banner", "-i", str(source)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        return r.stdout.strip()
-    except (FileNotFoundError, FFmpegError):
+    except FileNotFoundError:
         return ""
+
+    match = re.search(r"Audio:\s*([A-Za-z0-9_]+)", r.stderr)
+    return match.group(1).lower() if match else ""
 
 
 def convert_to_mp4(source: Path) -> Path:
     output_path = source.with_suffix(".mp4")
 
-    run(["ffmpeg", "-y", "-i", str(source), "-c", "copy", str(output_path)])
+    run([ffmpeg_exe(), "-y", "-i", str(source), "-c", "copy", str(output_path)])
 
     source.unlink()
 
     return output_path
 
 
-def convert_audio_to_wav(source: Path) -> Path:
+def convert_audio_to_wav(source: Path, keep_source: bool = False) -> Path:
     output_path = source.with_suffix(".wav")
 
     run(
         [
-            "ffmpeg",
+            ffmpeg_exe(),
             "-y",
             "-i",
             str(source),
@@ -79,18 +101,18 @@ def convert_audio_to_wav(source: Path) -> Path:
         ]
     )
 
-    if source != output_path:
+    if source != output_path and not keep_source:
         source.unlink()
 
     return output_path
 
 
-def convert_audio_to_mp3_320(source: Path) -> Path:
+def convert_audio_to_mp3_320(source: Path, keep_source: bool = False) -> Path:
     output_path = source.with_suffix(".mp3")
 
     run(
         [
-            "ffmpeg",
+            ffmpeg_exe(),
             "-y",
             "-i",
             str(source),
@@ -103,7 +125,7 @@ def convert_audio_to_mp3_320(source: Path) -> Path:
         ]
     )
 
-    if source != output_path:
+    if source != output_path and not keep_source:
         source.unlink()
 
     return output_path
@@ -127,7 +149,7 @@ def extract_flac(source: Path) -> Path:
     target = source.with_suffix(".flac")
     tmp = source.with_suffix(".tmp.flac")
 
-    run(["ffmpeg", "-y", "-i", str(source), "-c", "copy", str(tmp)])
+    run([ffmpeg_exe(), "-y", "-i", str(source), "-c", "copy", str(tmp)])
 
     tmp.replace(target)
     if source != target and source.exists():
